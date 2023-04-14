@@ -49,7 +49,8 @@ cmake -GNinja \
   -DLLVM_INCLUDE_TESTS=OFF \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$build_dir/install" \
-  -DLLVM_ENABLE_ASSERTIONS=ON
+  -DLLVM_ENABLE_ASSERTIONS=ON \
+  -DMLIR_INCLUDE_TESTS=ON
 
 cmake --build "$build_dir" --target all --target mlir-cpu-runner
 
