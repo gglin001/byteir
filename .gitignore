@@ -46,3 +46,5 @@ local_test*
 .vscode/
 
 /compile_commands.json
+
+/llvm-build/
