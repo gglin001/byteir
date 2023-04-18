@@ -48,3 +48,4 @@ local_test*
 /compile_commands.json
 
 /llvm-build/
+.cache/
