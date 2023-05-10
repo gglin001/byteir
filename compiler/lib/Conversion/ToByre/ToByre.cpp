@@ -43,6 +43,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include <functional>
 #include <string>
+#include <unordered_map>
 
 #include "../PassDetail.h"
 
@@ -71,15 +72,6 @@ bool isArgAlias(SmallVectorImpl<Value> &operands, Value src, Value dst) {
     operands.push_back(dst);
   }
   return is_arg_alias;
-}
-
-// return whether given constant should relocate to function arg
-template <typename ConstantOp>
-bool shouldConstantRelocate(ConstantOp constant) {
-  return false;
-}
-bool shouldConstantRelocate(lmhlo::ConstantOp op) {
-  return !op.getValue().isSplat();
 }
 } // namespace
 
@@ -915,10 +907,6 @@ public:
   LogicalResult
   matchAndRewrite(ConstantOp op, typename ConstantOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // it should be already relocated to function arg
-    if (shouldConstantRelocate(op))
-      return failure();
-
     // FIXME: only allow allocated memref for now
     auto alloc = op.getOutput().template getDefiningOp<memref::AllocOp>();
     if (!alloc)
@@ -1025,9 +1013,10 @@ struct ConvertToByrePass : public ConvertToByreBase<ConvertToByrePass> {
 
 struct ConvertFuncAndCallToByrePass
     : public ConvertFuncAndCallToByreBase<ConvertFuncAndCallToByrePass> {
-  ConvertFuncAndCallToByrePass(bool appendArgTypes)
+  ConvertFuncAndCallToByrePass(bool appendArgTypes, bool removeDupOutputs)
       : ConvertFuncAndCallToByreBase() {
     this->appendArgTypes = appendArgTypes;
+    this->removeDupOutputs = removeDupOutputs;
 
     // insert attrNames
     attrNames.push_back(byre::ByreDialect::getEntryPointFunctionAttrName());
@@ -1105,28 +1094,47 @@ static void identifyEntryPointFuncAndCalls(
   }
 }
 
-static inline void relocateFuncOpResultsForLmhlo(func::FuncOp func) {
+static inline void relocateFuncOpResults(func::FuncOp func,
+                                         bool removeDupOutputs) {
   unsigned idx = func.getNumArguments();
   replicateFuncOpResults(func, [&](func::ReturnOp retOp) {
-    llvm::SmallPtrSet<mlir::Operation *, 16> removeOps;
+    std::unordered_map<mlir::Operation *, mlir::Value> allocOps;
     mlir::OpBuilder opBuilder(retOp);
-    for (auto retVal : retOp.getOperands()) {
-      if (auto allocOp =
-              dyn_cast_or_null<memref::AllocOp>(retVal.getDefiningOp())) {
-        removeOps.insert(allocOp);
+    for (auto retValIter : llvm::enumerate(retOp.getOperands())) {
+      auto retVal = retValIter.value();
+      auto allocOp = retVal.getDefiningOp<memref::AllocOp>();
+      if (allocOp) {
+        if (allocOps.find(allocOp.getOperation()) == allocOps.end()) {
+          allocOps[allocOp.getOperation()] =
+              func.getArgument(idx + retValIter.index());
+        } else if (removeDupOutputs) {
+          assert(false && "Not implemented: remove dup function outputs");
+        } else {
+          // if not to remove dup memref.alloc values, insert a memref.copy
+          opBuilder.setInsertionPoint(retOp);
+          opBuilder.create<memref::CopyOp>(
+              retOp.getLoc(), retVal,
+              func.getArgument(idx + retValIter.index()));
+        }
+      } else {
+        // if return value not alloced in entry function (like inputs or alloced
+        // in inner function), insert a memref.copy.
+        opBuilder.setInsertionPoint(retOp);
+        opBuilder.create<memref::CopyOp>(
+            retOp.getLoc(), retVal, func.getArgument(idx + retValIter.index()));
       }
-      retVal.replaceAllUsesExcept(func.getArgument(idx++), retOp);
+    }
+    // replace alloc ops
+    for (auto op : allocOps) {
+      auto value = op.first->getResult(0);
+      value.replaceAllUsesWith(op.second);
+      op.first->erase();
     }
 
     // build and remove return first
     opBuilder.setInsertionPoint(retOp);
     opBuilder.create<func::ReturnOp>(retOp.getLoc());
     retOp.erase();
-
-    // remove all remove ops
-    for (auto op : removeOps) {
-      op->erase();
-    }
   });
 }
 
@@ -1162,41 +1170,6 @@ static inline void rewriteCallOpsForFuncOp(ArrayRef<func::CallOp> calls) {
   for (auto op : calls) {
     op->erase();
   }
-}
-
-static inline void relocateFuncOpConstantLikeForLmhlo(func::FuncOp func,
-                                                      unsigned unknownCnt) {
-
-  MLIRContext *ctx = func.getContext();
-  SmallVector<Attribute, 16> weightAttrs;
-
-  lmhlo::ConstantOp op;
-
-  relocateFuncOpConstantLike(
-      func,
-      [&](mlir::Operation *op) {
-        if (auto constant = dyn_cast<lmhlo::ConstantOp>(op)) {
-          return shouldConstantRelocate(constant);
-        }
-        return false;
-      },
-      [&](mlir::Operation *op) {
-        NamedAttrList attrList;
-        auto attr = op->getAttr("name");
-        if (attr != nullptr) {
-          attrList.append(byre::ByreDialect::getEntryPointFuncArgNameAttrName(),
-                          attr);
-        } else {
-          auto strAttr =
-              StringAttr::get(ctx, Twine("UnknowWeight") + Twine(unknownCnt++));
-          attrList.append(byre::ByreDialect::getEntryPointFuncArgNameAttrName(),
-                          strAttr);
-        }
-        attrList.append(byre::ByreDialect::getEntryPointFuncArgTypeAttrName(),
-                        byre::EntryFuncArgTypeAttr::get(
-                            op->getContext(), byre::EntryFuncArgType::Weight));
-        return std::make_tuple(op->getOperand(0), attrList);
-      });
 }
 
 static inline void markFuncOpInOutTypeForLmhlo(func::FuncOp func,
@@ -1279,7 +1252,6 @@ void ConvertFuncAndCallToByrePass::runOnOperation() {
   // rewrite private calls
   rewriteCallOpsForFuncOp(callCollector);
 
-  unsigned unknownWeightCnt = 0;
   unsigned inputCnt = 0, outputCnt = 0;
   for (auto func : entryCollector) {
     // Note: In this process we will give all arguments and results of given
@@ -1291,11 +1263,7 @@ void ConvertFuncAndCallToByrePass::runOnOperation() {
 
     rewriteByreResultAttrsToFuncResultAttr(func);
 
-    relocateFuncOpResultsForLmhlo(func);
-
-    if (isFuncWithEntryPointPlaceholder(func)) {
-      relocateFuncOpConstantLikeForLmhlo(func, unknownWeightCnt);
-    }
+    relocateFuncOpResults(func, this->removeDupOutputs);
 
     removeAttrPlaceholders(func, attrNames);
 
@@ -1435,8 +1403,10 @@ mlir::createConvertToByrePass(bool appendArgTypes) {
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>
-mlir::createConvertFuncAndCallToByrePass(bool appendArgTypes) {
-  return std::make_unique<ConvertFuncAndCallToByrePass>(appendArgTypes);
+mlir::createConvertFuncAndCallToByrePass(bool appendArgTypes,
+                                         bool removeDupOutputs) {
+  return std::make_unique<ConvertFuncAndCallToByrePass>(appendArgTypes,
+                                                        removeDupOutputs);
 }
 
 std::unique_ptr<OperationPass<func::FuncOp>>

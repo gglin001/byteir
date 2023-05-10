@@ -18,12 +18,13 @@
 #ifndef TORCH_FRONTEND_TRANSFORMS_REWRITECUSTOMOP_H
 #define TORCH_FRONTEND_TRANSFORMS_REWRITECUSTOMOP_H
 
-#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
-
 #include <memory>
 
 namespace mlir {
+namespace func {
+class FuncOp;
+} // namespace func
 
 std::unique_ptr<OperationPass<func::FuncOp>> createRewriteCustomOp();
 

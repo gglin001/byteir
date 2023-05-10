@@ -187,11 +187,14 @@ def ConvertFuncAndCallToByre : Pass<"convert-func-and-call-to-byre", "ModuleOp">
   let summary = "Convert func and call to Byre";
   let constructor = "mlir::createConvertFuncAndCallToByrePass()";
   let dependentDialects = [
+    "mlir::memref::MemRefDialect",
     "mlir::byre::ByreDialect",
   ];
   let options = [
     Option<"appendArgTypes", "append-arg-types", "bool", /*default=*/"false",
            "append arg types to Byre">,
+    Option<"removeDupOutputs", "remove-dup-outputs", "bool", /*default=*/"false",
+            "remove dup function outputs to avoid inserting copy">,
   ];
 }
 
@@ -256,6 +259,30 @@ def CollectFuncToLLVM : Pass<"collect-func-to-llvm", "mlir::ModuleOp"> {
   let summary =
       "Collect functions to submodule which will be converted to llvmir";
   let constructor = "mlir::createCollectFuncToLLVMPass()";
+}
+
+//===----------------------------------------------------------------------===//
+// FuseMhloToCat
+//===----------------------------------------------------------------------===//
+
+def FuseMhloToCat : Pass<"fuse-mhlo-to-cat", "func::FuncOp"> {
+  let summary = "Fuse mhlo ops to Cat Op.";
+  let constructor = "mlir::createFuseMhloToCatPass()";
+  let dependentDialects = [
+    "mlir::cat::CatDialect",
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// ToCat
+//===----------------------------------------------------------------------===//
+
+def MhloToCat : Pass<"mhlo-to-cat", "func::FuncOp"> {
+  let summary = "Convert mhlo op to Cat Op.";
+  let constructor = "mlir::createMhloToCatPass()";
+  let dependentDialects = [
+    "mlir::cat::CatDialect",
+  ];
 }
 
 #endif // BYTEIR_CONVERSION_PASSES
