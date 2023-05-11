@@ -50,7 +50,9 @@ cmake -GNinja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$build_dir/install" \
   -DLLVM_ENABLE_ASSERTIONS=ON \
-  -DMLIR_INCLUDE_TESTS=ON
+  -DMLIR_INCLUDE_TESTS=ON \
+  -DPython3_EXECUTABLE=$(which python) \
+  -DMLIR_ENABLE_BINDINGS_PYTHON=ON
 
 cmake --build "$build_dir" --target all --target mlir-cpu-runner
 
