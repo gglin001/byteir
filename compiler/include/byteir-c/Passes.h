@@ -27,8 +27,6 @@ extern "C" {
 
 MLIR_CAPI_EXPORTED void byteirRegisterAllPasses();
 
-MLIR_CAPI_EXPORTED void byteirRegisterAllTranslations();
-
 #ifdef __cplusplus
 }
 #endif
