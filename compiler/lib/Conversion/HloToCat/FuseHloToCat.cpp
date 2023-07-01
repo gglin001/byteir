@@ -17,11 +17,12 @@
 
 #include "byteir/Conversion/HloToCat/FuseHloToCat.h"
 #include "byteir/Dialect/Cat/IR/CatDialect.h"
+#include "byteir/Dialect/mhlo/Util/CustomCallUtil.h"
 #include "byteir/Utils/Utils.h"
 #include "mhlo/IR/hlo_ops.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/PatternMatch.h"
-#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #include "../PassDetail.h"
 #include "./Utils.h"
@@ -35,8 +36,8 @@ namespace mlir {
 namespace {
 
 mlir::StringAttr
-GetLayoutFromDotGeneralDimNums(mlir::mhlo::DotDimensionNumbersAttr dims,
-                               Builder *builder) {
+GetLayoutFrom3DDotGeneralDimNums(mlir::mhlo::DotDimensionNumbersAttr dims,
+                                 Builder *builder) {
   auto ldims = dims.getLhsContractingDimensions();
   auto rdims = dims.getRhsContractingDimensions();
   assert(ldims.size() == 1 && rdims.size() == 1);
@@ -59,25 +60,65 @@ GetLayoutFromConvDimNums(mlir::mhlo::ConvDimensionNumbersAttr dimension_numbers,
 
 #include "FuseHloToCatPattern.inc"
 
+struct ConvertSoftmax : public OpRewritePattern<mhlo::CustomCallOp> {
+  using OpRewritePattern<mhlo::CustomCallOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mhlo::CustomCallOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getCallTargetName() != getSoftmaxName())
+      return failure();
+    DictionaryAttr byteirAttrs =
+        op->getAttr(getCustomCallAttrName()).cast<DictionaryAttr>();
+    if (!byteirAttrs)
+      return failure();
+    auto axisAttr = byteirAttrs.get("axis").cast<IntegerAttr>();
+    auto newOp = rewriter.create<cat::SoftmaxOp>(
+        op.getLoc(), op.getResultTypes()[0], op.getOperands()[0], axisAttr);
+    rewriter.replaceOp(op, newOp.getResult());
+    return success();
+  }
+};
+
+struct ConvertLayerNorm : public OpRewritePattern<mhlo::CustomCallOp> {
+  using OpRewritePattern<mhlo::CustomCallOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mhlo::CustomCallOp op,
+                                PatternRewriter &rewriter) const override {
+    if (op.getCallTargetName() != getLayerNormName())
+      return failure();
+    DictionaryAttr byteirAttrs =
+        op->getAttr(getCustomCallAttrName()).cast<DictionaryAttr>();
+    if (!byteirAttrs)
+      return failure();
+    if (op.getResults().size() > 1)
+      return failure();
+    auto axisAttr = byteirAttrs.getAs<ArrayAttr>("axis");
+    assert(axisAttr && "LayerNorm custom call axis attribute not found.");
+
+    auto epsAttr = byteirAttrs.getAs<FloatAttr>("epsilon");
+    assert(epsAttr && "LayerNorm custom call epsilon attribute not found.");
+
+    auto newOp = rewriter.create<cat::LayerNormOp>(
+        op.getLoc(), op.getResultTypes()[0], op.getOperands()[0],
+        op.getOperands()[1], op.getOperands()[2], axisAttr, epsAttr);
+    rewriter.replaceOp(op, newOp.getResult());
+    return success();
+  }
+};
+
 struct FuseMhloToCatPass : public FuseMhloToCatBase<FuseMhloToCatPass> {
 public:
   FuseMhloToCatPass() = default;
   void runOnOperation() override {
     MLIRContext &ctx = getContext();
     RewritePatternSet patterns(&ctx);
-    ConversionTarget target(ctx);
+    // ConversionTarget target(ctx);
     auto funcOp = getOperation();
-
-    target.addLegalOp<cat::BMMPermuteOp>();
-    target.addLegalOp<cat::GemmBiasOp>();
-    target.addLegalOp<cat::Conv2dBiasOp>();
-    target.addLegalOp<cat::Conv2dBiasReluOp>();
-    target.addLegalOp<cat::Conv2dBiasAddReluOp>();
 
     populateFuseMhloToCatPattern(patterns);
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
 
-    if (failed(applyPartialConversion(funcOp, target, frozenPatterns))) {
+    if (failed(applyPatternsAndFoldGreedily(funcOp, frozenPatterns))) {
       signalPassFailure();
     }
   }
@@ -87,6 +128,7 @@ public:
 
 void populateFuseMhloToCatPattern(RewritePatternSet &patterns) {
   populateWithGenerated(patterns);
+  patterns.add<ConvertSoftmax, ConvertLayerNorm>(patterns.getContext());
 }
 
 std::unique_ptr<OperationPass<func::FuncOp>> createFuseMhloToCatPass() {

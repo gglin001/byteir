@@ -18,6 +18,7 @@
 #include "byteir/Dialect/Transform/Transforms/TransformInsertion.h"
 
 #include "byteir/Dialect/Linalg/TransformOps/LinalgExtTransformOps.h"
+#include "byteir/Dialect/Transform/IR/TransformExtOps.h"
 #include "byteir/Utils/IRRewrite.h"
 #include "byteir/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -133,9 +134,10 @@ struct FuseExtTransformInsertionPass
       auto pdlType = pdl::OperationType::get(b.getContext());
       SmallVector<Type> resultTypes(1 + tileSizes.size(), pdlType);
 
-      b.create<transform::FuseExtOp>(resultTypes, pdlValue,
+      b.create<transform::FuseExtOp>(resultTypes, pdlValue, nullptr,
                                      b.getI64ArrayAttr(tileSizes),
                                      b.getI64ArrayAttr(tileInterchange));
+      b.create<transform_ext::CleanupOp>(std::nullopt, std::nullopt);
     };
 
     insertTransformIR(getOperation(), {funcAnchorAttr, matchPrefix, opFilter,

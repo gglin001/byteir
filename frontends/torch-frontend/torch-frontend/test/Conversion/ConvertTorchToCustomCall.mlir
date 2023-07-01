@@ -41,13 +41,13 @@ func.func @torch.aten.layer_norm_v2(%arg0: !torch.vtensor<[3,7,4,5],f32>) -> !to
   %false = torch.constant.bool false
   %float1.000000e-05 = torch.constant.float 1.000000e-05
   %2 = torch.prim.ListConstruct %int4, %int5 : (!torch.int, !torch.int) -> !torch.list<int>
-  %result = torch.aten.layer_norm %arg0, %2, %1, %0, %float1.000000e-05, %false {byteir.layer_norm_v2 = true} : !torch.vtensor<[3,7,4,5],f32>, !torch.list<int>, !torch.vtensor<[4,5],f32>, !torch.vtensor<[4,5],f32>, !torch.float, !torch.bool -> !torch.vtensor<[3,7,4,5],f32>
+  %result = torch.aten.layer_norm %arg0, %2, %1, %0, %float1.000000e-05, %false {eps_outside_sqrt = true} : !torch.vtensor<[3,7,4,5],f32>, !torch.list<int>, !torch.vtensor<[4,5],f32>, !torch.vtensor<[4,5],f32>, !torch.float, !torch.bool -> !torch.vtensor<[3,7,4,5],f32>
   return %result : !torch.vtensor<[3,7,4,5],f32>
 }
 // CHECK-LABEL: func.func @torch.aten.layer_norm
 // CHECK: mhlo.custom_call
 // CHECK-SAME: @byteir.layer_norm
-// CHECK: byteir_attrs = {axis = [2, 3], byteir.layer_norm_v2 = true, epsilon = 1.000000e-05 : f64}
+// CHECK: byteir_attrs = {axis = [2, 3], eps_outside_sqrt = true, epsilon = 1.000000e-05 : f64}
 // CHECK-NOT: torch.aten.layer_norm
 
 func.func @torch.aten.softmax.int(%t: !torch.vtensor<[2,3],f32>) -> !torch.vtensor<[2,3],f32> {
@@ -174,3 +174,29 @@ func.func @torch.custom.dynamic_mask_stitch(%arg0: !torch.vtensor<[?,?],f32>, %a
 // CHECK-SAME: @tf.DynamicMaskStitch
 // CHECK: byteir_attrs = {}
 // CHECH-NOT: torch.custom_op
+
+func.func @torch.aten.nll_loss_forward(%arg0: !torch.vtensor<[8192,50257],f32>, %arg1: !torch.vtensor<[8192],si64>) -> (!torch.vtensor<[],f32>, !torch.vtensor<[],f32>) {
+  %int1 = torch.constant.int 1
+  %int-1 = torch.constant.int -1
+  %none = torch.constant.none
+  %output, %total_weight = torch.aten.nll_loss_forward %arg0, %arg1, %none, %int1, %int-1 : !torch.vtensor<[8192,50257],f32>, !torch.vtensor<[8192],si64>, !torch.none, !torch.int, !torch.int -> !torch.vtensor<[],f32>, !torch.vtensor<[],f32>
+  return %output, %total_weight : !torch.vtensor<[],f32>, !torch.vtensor<[],f32>
+}
+// CHECK-LABEL: func.func @torch.aten.nll_loss_forward
+// CHECK: mhlo.custom_call
+// CHECK-SAME: @byteir.nll_loss_forward
+// CHECK: byteir_attrs = {ignore_index = -1 : i64, reduction = 1 : i64}
+// CHECH-NOT: torch.aten.nll_loss_forward
+
+func.func @torch.aten.nll_loss_backward(%arg0: !torch.vtensor<[],f32>, %arg1: !torch.vtensor<[8192,50257],f32>, %arg2: !torch.vtensor<[8192],si64>, %arg3: !torch.vtensor<[],f32>) -> (!torch.vtensor<[8192,50257],f32>) {
+  %int1 = torch.constant.int 1
+  %int-1 = torch.constant.int -1
+  %none = torch.constant.none
+  %0 = torch.aten.nll_loss_backward %arg0, %arg1, %arg2, %none, %int1, %int-1, %arg3 : !torch.vtensor<[],f32>, !torch.vtensor<[8192,50257],f32>, !torch.vtensor<[8192],si64>, !torch.none, !torch.int, !torch.int, !torch.vtensor<[],f32> -> !torch.vtensor<[8192,50257],f32>
+  return %0 : !torch.vtensor<[8192,50257],f32>
+}
+// CHECK-LABEL: func.func @torch.aten.nll_loss_backward
+// CHECK: mhlo.custom_call
+// CHECK-SAME: @byteir.nll_loss_backward
+// CHECK: byteir_attrs = {ignore_index = -1 : i64, reduction = 1 : i64}
+// CHECH-NOT: torch.aten.nll_loss_backward

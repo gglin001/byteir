@@ -39,6 +39,14 @@ constexpr llvm::StringRef getLogSoftmaxName() {
   return CUSTOM_CALL_NAME_PREFIX "log_softmax";
 }
 
+constexpr llvm::StringRef getNllLossForwardName() {
+  return CUSTOM_CALL_NAME_PREFIX "nll_loss_forward";
+}
+
+constexpr llvm::StringRef getNllLossBackwardName() {
+  return CUSTOM_CALL_NAME_PREFIX "nll_loss_backward";
+}
+
 constexpr llvm::StringRef getGeLUName() {
   return CUSTOM_CALL_NAME_PREFIX "gelu";
 }
@@ -59,10 +67,6 @@ constexpr llvm::StringRef getArgMinName() {
 
 constexpr llvm::StringRef getLayerNormName() {
   return CUSTOM_CALL_NAME_PREFIX "layer_norm";
-}
-
-constexpr llvm::StringRef getLayerNormV2Name() {
-  return CUSTOM_CALL_NAME_PREFIX "layer_norm_v2";
 }
 
 constexpr llvm::StringRef getL2NormName() {

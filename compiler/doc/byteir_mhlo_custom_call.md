@@ -47,12 +47,12 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
 ### byteir.layer_norm
 - Operands:
   - input: Tensor
-  - weight: Optional\<Tensor>
-  - bias: Optional\<Tensor>
+  - weight: Tensor
+  - bias: Tensor
 - Attrs
   - epsilon: F64Attr
   - axis: I64ArrayAttr
-  - byteir.layer_norm_v2: Optional\<BoolAttr>
+  - eps_outside_sqrt: Optional\<BoolAttr>
 - Results(1 or 3):
   - output: Tensor 
   - mean: Optional\<Tensor>

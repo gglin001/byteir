@@ -384,8 +384,8 @@ public:
                           effectiveAppendArgTypes);
 
     mlir::byre::ComputeOp computeOp =
-        rewriter.replaceOpWithNewOp<byre::ComputeOp>(op, key, operands,
-                                                     memoryEffectsAttr);
+        rewriter.replaceOpWithNewOp<byre::ComputeOp>(
+            op, TypeRange{}, key, operands, memoryEffectsAttr);
 
     // copy byre attr, and remove prefix
     SmallVector<NamedAttribute> attrs;
@@ -422,7 +422,11 @@ public:
                                                        dst, 0);
           } else {
             // copy src to dst
-            rewriter.create<byre::CopyOp>(loc, src, dst);
+            if (src.getType() != dst.getType()) {
+              src = rewriter.create<byre::AliasOp>(op->getLoc(), dst.getType(),
+                                                   src, 0);
+            }
+            rewriter.create<memref::CopyOp>(loc, src, dst);
           }
         }
       }
@@ -1203,7 +1207,8 @@ static inline void rewriteCallOpsForFuncOp(ArrayRef<func::CallOp> calls) {
 
   // remove all remove ops
   for (auto op : calls) {
-    op->erase();
+    if (!op->hasAttr(getByreCallOpReadonlyOperandNumAttrName()))
+      op->erase();
   }
 }
 
