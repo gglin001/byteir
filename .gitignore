@@ -47,6 +47,7 @@ local_test*
 
 /compile_commands.json
 
-/llvm-build/
+llvm-build/
+llvm-project/
 .cache/
 t.sh
