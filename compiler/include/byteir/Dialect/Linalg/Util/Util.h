@@ -20,6 +20,7 @@
 
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallVector.h"
@@ -72,6 +73,14 @@ void getGenericEffectsImpl(
         &effects,
     ValueRange results, const OpOperandVector &inputOperands,
     const OpOperandVector &outputOperands);
+
+void calculateTileOffsetsAndSizes(
+    RewriterBase &b, Location loc, ValueRange inductionVars,
+    ArrayRef<OpFoldResult> numTiles, const SmallVector<Range> &loogRanges,
+    bool omitTileOffsetBoundsCheck,
+    std::optional<ArrayRef<OpFoldResult>> nominalTileSizes,
+    SmallVector<OpFoldResult> &tiledOffsets,
+    SmallVector<OpFoldResult> &tiledSizes);
 
 } // namespace mlir
 

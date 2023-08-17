@@ -646,21 +646,17 @@ mlir::mhlo::foldConcatWithSlicesAndRehape(mhlo::ConcatenateOp op,
 
     auto sliceOperandShape =
         iter->first.getType().cast<ShapedType>().getShape();
-    auto sliceSize = sliceOperandShape.back() / opOperandList.size();
 
-    // only support that extract slices on the last dimension
+    // TODO: only support that extract slices on the last dimension, relax it
+    // later
     if ((sliceOperandShape.back() % opOperandList.size()) != 0) {
       continue;
     }
-    // only support that reshape expand's dim is  equal to concat dim
-    auto expandDim = computeReshapeExpandDim(
-        opOperandList[0]->get().getDefiningOp<mhlo::ReshapeOp>());
-    if ((!expandDim.has_value()) || (*expandDim != concatDim)) {
-      continue;
-    }
+    auto sliceSize = sliceOperandShape.back() / opOperandList.size();
+
+    bool isAllSliceOpLegal = true;
     for (unsigned i = 0; i < opOperandList.size(); i++) {
       auto reshapeOp = opOperandList[i]->get().getDefiningOp<mhlo::ReshapeOp>();
-      // TODO: support slice on arbitrary dimension
       auto slice = reshapeOp.getOperand().getDefiningOp<mhlo::SliceOp>();
       auto startAttr = slice.getStartIndices();
       auto limitAttr = slice.getLimitIndices();
@@ -671,16 +667,33 @@ mlir::mhlo::foldConcatWithSlicesAndRehape(mhlo::ConcatenateOp op,
               (limitAttr.getValues<IntegerAttr>()[j].getInt() !=
                sliceOperandShape[j]) ||
               (stridesAttr.getValues<IntegerAttr>()[j].getInt() != 1)) {
-            continue;
+            isAllSliceOpLegal = false;
+            break;
           }
         } else if ((startAttr.getValues<IntegerAttr>()[j].getInt() !=
                     i * sliceSize) ||
                    (limitAttr.getValues<IntegerAttr>()[j].getInt() !=
                     (i + 1) * sliceSize) ||
                    (stridesAttr.getValues<IntegerAttr>()[j].getInt() != 1)) {
-          continue;
+          isAllSliceOpLegal = false;
+          break;
         }
       }
+      if (!isAllSliceOpLegal) {
+        break;
+      }
+    }
+    if (!isAllSliceOpLegal) {
+      continue;
+    }
+
+    auto expandDim = computeReshapeExpandDim(
+        opOperandList[0]->get().getDefiningOp<mhlo::ReshapeOp>());
+
+    // only support that reshape expand's dim is  equal to concat dim
+    if ((!expandDim.has_value()) || (*expandDim != concatDim) ||
+        (*expandDim != sliceOperandShape.size() - 1)) {
+      continue;
     }
     SmallVector<int64_t> newReshapeShape(sliceOperandShape.begin(),
                                          sliceOperandShape.end());
@@ -1406,19 +1419,6 @@ LogicalResult mlir::mhlo::foldLargeSliceOp(mhlo::SliceOp op,
   return failure();
 }
 
-namespace {
-// this function copied from mlir-hlo/lib/Dialect/mhlo/IR/hlo_ops.cc
-DenseElementsAttr reshape(DenseElementsAttr attr, ShapedType newType) {
-  // TODO(b/232866626): DenseElementsAttr::reshape is broken for bool splats.
-  // Once that ticket is fixed, we can remove this conditional.
-  if (attr.isSplat() && newType.getElementType().isInteger(/*width=*/1)) {
-    auto splatValue = attr.getValues<bool>()[0];
-    return DenseElementsAttr::get(newType, {splatValue});
-  }
-  return attr.reshape(newType);
-}
-} // namespace
-
 // const + broadcast_in_dim => const + broadcast_in_dim
 LogicalResult
 mlir::mhlo::canonicalizeBroadcastInDimConst(mhlo::BroadcastInDimOp op,
@@ -1443,7 +1443,7 @@ mlir::mhlo::canonicalizeBroadcastInDimConst(mhlo::BroadcastInDimOp op,
   }
   auto newValueType =
       RankedTensorType::get(newValueShape, valueType.getElementType());
-  valueAttr = reshape(valueAttr, newValueType);
+  valueAttr = reshapeDenseElementsAttr(valueAttr, newValueType);
   mhlo::ConstantOp newConstOp =
       rewriter.create<mhlo::ConstantOp>(constOp->getLoc(), valueAttr);
   op.setOperand(newConstOp.getOutput());
@@ -1503,6 +1503,103 @@ mlir::mhlo::canonicalizeConcatWithBroadcast(mhlo::ConcatenateOp op,
   return success();
 }
 
+LogicalResult mlir::mhlo::simplifyCumsumToIota(mhlo::ReduceWindowOp op,
+                                               PatternRewriter &rewriter) {
+  if (op.getInputs().size() != 1 || op->getNumResults() != 1 ||
+      op.getInitValues().size() != 1) {
+    return failure();
+  }
+  if (!isSplatMhloConstantValue(op.getInputs()[0])) {
+    return failure();
+  }
+  Attribute constAttr;
+  if (!matchPattern(op.getInitValues()[0], m_Constant(&constAttr))) {
+    return failure();
+  }
+  Region &region = op.getBody();
+  if (region.getBlocks().size() != 1) {
+    return rewriter.notifyMatchFailure(op,
+                                       "unsupported region in reduce_window");
+  }
+  if (!isBlockSingleOp<mhlo::AddOp>(&region.front()) ||
+      !isZeroAttribute(constAttr)) {
+    return failure();
+  }
+
+  auto maybeIndex = getCumsumIndex(op);
+  if (!maybeIndex.has_value()) {
+    return failure();
+  }
+  TensorType inputType = op.getInputs()[0].getType().cast<TensorType>();
+  Attribute one;
+  if (inputType.getElementType().isa<FloatType>()) {
+    one = rewriter.getFloatAttr(inputType.getElementType(), 1.0);
+  } else if (inputType.getElementType().isa<IntegerType>()) {
+    one = rewriter.getIntegerAttr(inputType.getElementType(), 1);
+  } else {
+    return failure();
+  }
+  Value constOne = rewriter.create<mhlo::ConstantOp>(
+      op.getLoc(), DenseElementsAttr::get(inputType, one));
+  Value iota =
+      rewriter.create<mhlo::IotaOp>(op.getLoc(), inputType, maybeIndex.value());
+  Value addOne =
+      rewriter.create<mhlo::AddOp>(op.getLoc(), inputType, iota, constOne);
+  Value result =
+      rewriter.create<mhlo::MulOp>(op.getLoc(), addOne, op.getInputs()[0]);
+  rewriter.replaceOp(op, result);
+  return success();
+}
+
+// TODO(lyq): make this pattern more robust
+// transpose(reshape(transpose(x))) => reshape(x)
+LogicalResult
+mlir::mhlo::simplifyTransposeReshapeTranspose(mhlo::TransposeOp op,
+                                              PatternRewriter &rewriter) {
+  auto reshapeOp = op.getOperand().getDefiningOp<mhlo::ReshapeOp>();
+  if (!reshapeOp) {
+    return failure();
+  }
+  auto transposeOp = reshapeOp.getOperand().getDefiningOp<mhlo::TransposeOp>();
+  if (!transposeOp) {
+    return failure();
+  }
+  SmallVector<int64_t> opPermutation(
+      op.getPermutation().getValues<int64_t>().begin(),
+      op.getPermutation().getValues<int64_t>().end());
+  if (opPermutation.size() != 3) {
+    return failure();
+  }
+  if (opPermutation[0] != 0 || opPermutation[1] != 2 || opPermutation[2] != 1) {
+    return failure();
+  }
+  SmallVector<int64_t> transposeOpPermutation(
+      transposeOp.getPermutation().getValues<int64_t>().begin(),
+      transposeOp.getPermutation().getValues<int64_t>().end());
+  if (transposeOpPermutation.size() != 4) {
+    return failure();
+  }
+  if (transposeOpPermutation[0] != 0 || transposeOpPermutation[1] != 1 ||
+      transposeOpPermutation[2] != 3 || transposeOpPermutation[3] != 2) {
+    return failure();
+  }
+  auto reshapeOperandType = reshapeOp.getOperand().getType().cast<ShapedType>();
+  auto reshapeResultType = reshapeOp.getType().cast<ShapedType>();
+  if (!reshapeOperandType.hasStaticShape()) {
+    return failure();
+  }
+  if (reshapeOperandType.getDimSize(0) * reshapeOperandType.getDimSize(1) !=
+          reshapeResultType.getDimSize(0) ||
+      reshapeOperandType.getDimSize(2) != reshapeResultType.getDimSize(1) ||
+      reshapeOperandType.getDimSize(3) != reshapeResultType.getDimSize(2)) {
+    return failure();
+  }
+
+  rewriter.replaceOpWithNewOp<mhlo::ReshapeOp>(op, op.getType(),
+                                               transposeOp.getOperand());
+  return success();
+}
+
 void mlir::mhlo::populateCanonicalizeExtPatterns(RewritePatternSet &patterns,
                                                  MLIRContext *ctx,
                                                  bool blindFold) {
@@ -1527,6 +1624,8 @@ void mlir::mhlo::populateCanonicalizeExtPatterns(RewritePatternSet &patterns,
   patterns.add(mlir::mhlo::simplifyAddInsertSlicesToInsertSlices);
   patterns.add(mlir::mhlo::eliminateRedundantConvertFromI1);
   patterns.add(mlir::mhlo::foldConcatWithSlicesAndRehape);
+  patterns.add(mlir::mhlo::simplifyCumsumToIota);
+  patterns.add(mlir::mhlo::simplifyTransposeReshapeTranspose);
   if (blindFold) {
     patterns.add(mlir::mhlo::foldLargeConcatenate);
   }

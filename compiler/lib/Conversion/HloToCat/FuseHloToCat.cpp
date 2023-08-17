@@ -49,6 +49,7 @@ GetLayoutFrom3DDotGeneralDimNums(mlir::mhlo::DotDimensionNumbersAttr dims,
     return builder->getStringAttr("crr");
   if (ldims[0] == 1 && rdims[0] == 2)
     return builder->getStringAttr("ccr");
+  llvm_unreachable("unsupported dot dimension_numbers");
 }
 
 mlir::StringAttr
@@ -72,9 +73,23 @@ struct ConvertSoftmax : public OpRewritePattern<mhlo::CustomCallOp> {
     if (!byteirAttrs)
       return failure();
     auto axisAttr = byteirAttrs.get("axis").cast<IntegerAttr>();
-    auto newOp = rewriter.create<cat::SoftmaxOp>(
-        op.getLoc(), op.getResultTypes()[0], op.getOperands()[0], axisAttr);
-    rewriter.replaceOp(op, newOp.getResult());
+    auto resultTy = op.getResultTypes()[0].cast<ShapedType>();
+    auto inputTy = op.getOperands()[0].getType().cast<ShapedType>();
+    auto softmaxTy = resultTy;
+    bool needConvert = resultTy.getElementType() != inputTy.getElementType();
+    if (needConvert) {
+      softmaxTy =
+          RankedTensorType::get(resultTy.getShape(), inputTy.getElementType());
+    }
+    auto newOp = rewriter.create<cat::SoftmaxOp>(op.getLoc(), softmaxTy,
+                                                 op.getOperands()[0], axisAttr);
+    if (needConvert) {
+      auto castOp = rewriter.create<mhlo::ConvertOp>(op.getLoc(), resultTy,
+                                                     newOp.getResult());
+      rewriter.replaceOp(op, castOp.getResult());
+    } else {
+      rewriter.replaceOp(op, newOp.getResult());
+    }
     return success();
   }
 };
@@ -157,6 +172,116 @@ struct ConvertTransposeGemmRrrToBmmCrr
   }
 };
 
+// bmm_rrr(x, reshape(transpose(y, [0,1,3,2]))) -> bmm_rcr(x, reshape(y))
+struct ConvertTransposeReshapeBmmRrrToBmmRcr
+    : public OpRewritePattern<cat::BMMRRROp> {
+  using OpRewritePattern<cat::BMMRRROp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(cat::BMMRRROp op,
+                                PatternRewriter &rewriter) const override {
+    auto reshapeOp = op.getRhs().getDefiningOp<mhlo::ReshapeOp>();
+    if (!reshapeOp) {
+      return failure();
+    }
+    auto transposeOp =
+        reshapeOp.getOperand().getDefiningOp<mhlo::TransposeOp>();
+    if (!transposeOp) {
+      return failure();
+    }
+    SmallVector<int64_t> permutation;
+    getValuesFromDenseIntElementsAttr(transposeOp.getPermutation(),
+                                      permutation);
+    auto transposeIn = transposeOp.getOperand(); // transpose_in = rhs
+    auto transposeInShape = transposeIn.getType().getShape();
+    auto lhs = op.getLhs();
+    if (permutation.size() != 4) {
+      return failure();
+    }
+    if (permutation[0] != 0 || permutation[1] != 1 || permutation[2] != 3 ||
+        permutation[3] != 2) {
+      return failure();
+    }
+    auto reshapeOperandShape =
+        reshapeOp.getOperand().getType().cast<ShapedType>().getShape();
+    auto reshapeResultShape =
+        reshapeOp.getResult().getType().cast<ShapedType>().getShape();
+    if (reshapeResultShape.size() != 3) {
+      return failure();
+    }
+    if (reshapeResultShape[0] !=
+            reshapeOperandShape[0] * reshapeOperandShape[1] ||
+        reshapeResultShape[1] != reshapeOperandShape[2] ||
+        reshapeResultShape[2] != reshapeOperandShape[3]) {
+      return failure();
+    }
+    // build reshape rhs op
+    RankedTensorType transposeInReshapedType =
+        RankedTensorType::get({transposeInShape[0] * transposeInShape[1],
+                               transposeInShape[2], transposeInShape[3]},
+                              transposeIn.getType().getElementType());
+    auto rhsReshapeOp = rewriter.create<mhlo::ReshapeOp>(
+        op.getLoc(), transposeInReshapedType, transposeIn);
+    // build cat bmm rcr op
+    auto newOp = rewriter.create<cat::BMMRCROp>(op.getLoc(), op.getType(), lhs,
+                                                rhsReshapeOp);
+    rewriter.replaceOp(op, newOp.getResult());
+    return success();
+  }
+};
+
+struct ConvertBmmRrrReshapeTransposeToBmmRrc
+    : public OpRewritePattern<mhlo::TransposeOp> {
+  using OpRewritePattern<mhlo::TransposeOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(mhlo::TransposeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto reshapeOp = op.getOperand().getDefiningOp<mhlo::ReshapeOp>();
+    if (!reshapeOp || !reshapeOp.getResult().hasOneUse()) {
+      return failure();
+    }
+    auto bmmrrrOp = reshapeOp.getOperand().getDefiningOp<cat::BMMRRROp>();
+    if (!bmmrrrOp || !bmmrrrOp.getResult().hasOneUse()) {
+      return failure();
+    }
+    SmallVector<int64_t> permutation;
+    getValuesFromDenseIntElementsAttr(op.getPermutation(), permutation);
+    if (permutation.size() != 4) {
+      return failure();
+    }
+    if (permutation[0] != 0 || permutation[1] != 1 || permutation[2] != 3 ||
+        permutation[3] != 2) {
+      return failure();
+    }
+    auto reshapeOperandShape =
+        reshapeOp.getOperand().getType().cast<ShapedType>().getShape();
+    auto reshapeResultShape =
+        reshapeOp.getResult().getType().cast<ShapedType>().getShape();
+    if (reshapeOperandShape.size() != 3) {
+      return failure();
+    }
+    if (reshapeOperandShape[0] !=
+            reshapeResultShape[0] * reshapeResultShape[1] ||
+        reshapeOperandShape[1] != reshapeResultShape[2] ||
+        reshapeOperandShape[2] != reshapeResultShape[3]) {
+      return failure();
+    }
+
+    auto bmmrrrOpType = bmmrrrOp.getType().cast<ShapedType>();
+    // build bmm_rrc op
+    RankedTensorType bmmrrcResultType = RankedTensorType::get(
+        {bmmrrrOpType.getDimSize(0), bmmrrrOpType.getDimSize(2),
+         bmmrrrOpType.getDimSize(1)},
+        bmmrrrOpType.getElementType());
+    auto bmmrrcOp = rewriter.create<cat::BMMRRCOp>(
+        op.getLoc(), bmmrrcResultType, bmmrrrOp.getLhs(), bmmrrrOp.getRhs());
+    // build new reshape op
+    auto newShapeOp = rewriter.create<mhlo::ReshapeOp>(
+        op.getLoc(), op.getType(), bmmrrcOp.getResult());
+    rewriter.replaceOp(op, newShapeOp.getResult());
+    return success();
+  }
+};
+
 struct FuseMhloToCatPass : public FuseMhloToCatBase<FuseMhloToCatPass> {
 public:
   FuseMhloToCatPass() = default;
@@ -179,9 +304,13 @@ public:
 
 void populateFuseMhloToCatPattern(RewritePatternSet &patterns) {
   populateWithGenerated(patterns);
-  patterns
-      .add<ConvertSoftmax, ConvertLayerNorm, ConvertTransposeGemmRrrToBmmCrr>(
-          patterns.getContext());
+  // clang-format off
+  patterns.add<ConvertSoftmax,
+               ConvertLayerNorm,
+               ConvertTransposeGemmRrrToBmmCrr,
+               ConvertTransposeReshapeBmmRrrToBmmRcr,
+               ConvertBmmRrrReshapeTransposeToBmmRrc>(patterns.getContext());
+  // clang-format on
 }
 
 std::unique_ptr<OperationPass<func::FuncOp>> createFuseMhloToCatPass() {

@@ -46,6 +46,45 @@ def AnnotateOp : Op<Transform_Dialect, "annotate",
   let assemblyFormat = "$target attr-dict";
 }
 
+def CollapseDimsOp : Op<Transform_Dialect, "structured.collapse_dims",
+       [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+        DeclareOpInterfaceMethods<TransformOpInterface>]> {
+  let description = [{
+    Collapse dimensions of linalg.generic operation
+  }];
+
+  let arguments = (ins PDL_Operation:$target,
+                       IndexListArrayAttr:$reassociation);
+  let results = (outs PDL_Operation:$transformed);
+
+  let assemblyFormat = "$target $reassociation attr-dict";
+  
+  code extraClassDeclaration = [{
+    SmallVector<ReassociationIndices, 4> getReassociationIndices() {
+      SmallVector<ReassociationIndices, 4> reassociationIndices;
+      for (auto attr : getReassociation())
+        reassociationIndices.push_back(llvm::to_vector<2>(
+            llvm::map_range(::llvm::cast<ArrayAttr>(attr), [&](Attribute indexAttr) {
+              return ::llvm::cast<IntegerAttr>(indexAttr).getInt();
+            })));
+      return reassociationIndices;
+    };
+  }];
+}
+
+def FoldUnitExtentDimsOp : Op<Transform_Dialect, "structured.fold_unit_extent_dims",
+       [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+        DeclareOpInterfaceMethods<TransformOpInterface>]> {
+  let description = [{
+    Remove unit-extent dimension in Linalg ops on tensors
+  }];
+
+  let arguments = (ins PDL_Operation:$target);
+  let results = (outs PDL_Operation:$transformed);
+
+  let assemblyFormat = "$target attr-dict";
+}
+
 def FuseExtOp : Op<Transform_Dialect, "structured.fuse_ext",
     [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
      DeclareOpInterfaceMethods<TransformOpInterface>]> {
@@ -183,6 +222,27 @@ def SharedOutputToDistributedStyleOp : Op<Transform_Dialect,
                       PDL_Operation:$new_init);
 
   let hasCustomAssemblyFormat = 1;
+}
+
+def FuseOperandsOp : Op<Transform_Dialect, "structured.fuse_operands",
+    [FunctionalStyleTransformOpTrait, MemoryEffectsOpInterface,
+     DeclareOpInterfaceMethods<TransformOpInterface>]> {
+  let description = [{
+    Tiles all the operands of the target handle together and fuses
+    their producers greedily using the options provided as attributes.
+  }];
+
+  let arguments =
+    (ins PDL_Operation:$target,
+         DefaultValuedAttr<I64ArrayAttr, "{}">:$tile_nums,
+         DefaultValuedAttr<I64ArrayAttr, "{}">:$tile_interchange,
+         DefaultValuedAttr<I64ArrayAttr, "{}">:$use_distributed,
+         DefaultValuedAttr<BoolAttr, "false">:$expect_whole_graph_fusion);
+  let results = (outs PDL_Operation:$transformed,
+                      Variadic<PDL_Operation>:$loops);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 #endif // BYTEIR_DIALECT_LINALG_TRANSFORMOPS_LINALG_EXT_TRANSFORMOPS

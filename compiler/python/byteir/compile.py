@@ -4,11 +4,34 @@ from byteir.passmanager import PassManager
 from byteir.dialects.cat import IRProcessor
 from pathlib import Path
 import os
+from subprocess import PIPE, Popen
 
 def _print_verbose(module, pipeline_msg: str):
     print(pipeline_msg)
     print(module.operation.get_asm(large_elements_limit=10))
     print()
+
+def _detect_cuda_with_nvidia_smi():
+    try:
+        proc = Popen(
+            ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv"],
+            stdout=PIPE,
+            stderr=PIPE,
+        )
+        stdout, stderr = proc.communicate()
+        stdout = stdout.decode("utf-8")
+        sm_names = {
+            "sm_70": ["V100"],
+            "sm_75": ["T4", "Quadro T2000"],
+            "sm_80": ["PG509", "A100", "A10", "RTX 30", "A30", "RTX 40"],
+            "sm_90": ["H100"],
+        }
+        for sm, names in sm_names.items():
+            if any(name in stdout for name in names):
+                return sm
+        return None
+    except Exception:
+        return None
 
 def compile_cuda(
     input: str,
@@ -51,9 +74,9 @@ def compile_cuda(
     if verbose:
         _print_verbose(module, "// IR Dump After Linalg Memref Opt:")
     with context:
-        PassManager.parse("builtin.module(affine-opt)").run(module.operation)
+        PassManager.parse("builtin.module(scf-opt)").run(module.operation)
     if verbose:
-        _print_verbose(module, "// IR Dump After Affine Opt:")
+        _print_verbose(module, "// IR Dump After SCF Opt:")
     with context:
         PassManager.parse("builtin.module(gpu-opt)").run(module.operation)
     if verbose:
@@ -94,6 +117,8 @@ def compile_cuda_with_ait(
     entry_func: str = "main",
     verbose: bool = False,
     name: str = "model",
+    aggressive_mode: bool = False,
+    parallelism: int = 1,
     **kwargs,
 ):
     target = "cuda"
@@ -105,7 +130,7 @@ def compile_cuda_with_ait(
     entry_func_str = "entry-func={}".format(entry_func)
     target_str = "target={}".format(target)
 
-    processor = IRProcessor(name, "./workspace")
+    processor = IRProcessor(name, "./workspace", compile_parallelism=parallelism)
     with context:
         processor.load_from_file(input)
     if verbose:
@@ -114,12 +139,12 @@ def compile_cuda_with_ait(
     if verbose:
         _print_verbose(processor.module, "// IR Dump After Cat Preprocess:")
     with context:
-        processor.cat_opt_pass(anchor_only=False)
+        processor.cat_opt_pass(anchor_only=False, aggressive_mode=aggressive_mode)
     if verbose:
         _print_verbose(processor.module, "// IR Dump After Cat Opt:")
     # clustering
     with context:
-        processor.hlo_opt_pass(outline_single_elemwise_op=True)
+        processor.hlo_opt_pass(outline_single_elemwise_op=True, aggressive_mode=aggressive_mode)
     if verbose:
         _print_verbose(processor.module, "// IR Dump After Hlo Opt:")
     # generate ait .so for subgraphs
@@ -141,7 +166,7 @@ def compile_cuda_with_ait(
     with context:
         PassManager.parse("builtin.module(byre-tensor-opt{{append-arg-types {}}})".format(entry_func_str)).run(processor.module.operation)
     if verbose:
-        _print_verbose(processor.module, "// IR Dump After Linalg Tensor Opt:")
+        _print_verbose(processor.module, "// IR Dump After Byre Tensor Opt:")
     with context:
         PassManager.parse("builtin.module(byteir-bufferize-opt)").run(processor.module.operation)
     if verbose:
@@ -151,9 +176,9 @@ def compile_cuda_with_ait(
     if verbose:
         _print_verbose(processor.module, "// IR Dump After Linalg Memref Opt:")
     with context:
-        PassManager.parse("builtin.module(affine-opt)").run(processor.module.operation)
+        PassManager.parse("builtin.module(scf-opt)").run(processor.module.operation)
     if verbose:
-        _print_verbose(processor.module, "// IR Dump After Affine Opt:")
+        _print_verbose(processor.module, "// IR Dump After SCF Opt:")
     with context:
         PassManager.parse("builtin.module(gpu-opt)").run(processor.module.operation)
     if verbose:
@@ -177,7 +202,7 @@ def compile_cuda_with_ait(
         if verbose:
             _print_verbose(device_module, "// IR Dump After NVVM Codegen:")
         # write to output device ptx
-        byteir.translate_to_ptx(device_module.operation, output_file_dir + "/" + output_file_name)
+        byteir.translate_to_ptx(device_module.operation, output_file_dir + "/" + output_file_name, _detect_cuda_with_nvidia_smi())
 
     with context:
         PassManager.parse("builtin.module(byre-host{device-file-name=" + output_file_name + ".ptx" + " " + target_str + " " + entry_func_str + "})").run(processor.module.operation)
@@ -194,11 +219,14 @@ def compile(
     entry_func: str = "main",
     target: str = "cuda",
     verbose: bool = False,
+    parallelism: int = 1,
     **kwargs,
 ):
     if target == "cuda":
         compile_cuda(input, output, entry_func, verbose)
     elif target == "cuda_with_ait":
-        compile_cuda_with_ait(input, output, entry_func, verbose)
+        compile_cuda_with_ait(input, output, entry_func, verbose, parallelism=parallelism)
+    elif target == "cuda_with_ait_aggressive":
+        compile_cuda_with_ait(input, output, entry_func, verbose, aggressive_mode=True, parallelism=parallelism)
     else:
         raise NotImplemented("not implemented target: {}".format(target))

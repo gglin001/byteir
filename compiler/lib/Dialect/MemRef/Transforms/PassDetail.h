@@ -24,6 +24,9 @@
 // forward dialects for conversions
 namespace mlir {
 class AffineDialect;
+namespace arith {
+class ArithDialect;
+} // namespace arith
 
 namespace func {
 class FuncOp;

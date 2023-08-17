@@ -14,54 +14,22 @@
 
 import random
 import torch
+import os
+import numpy as np
 from typing import Set
 
-from aitemplate.compiler.base import IntImm, IntVar, Tensor
+from aitemplate.compiler.base import IntImm, IntVar, Tensor, _NumpyConstantTensorData
 from aitemplate.compiler import compile_model
 from aitemplate.testing import detect_target
 
 from .backend.ait_registry import *
-from mhlo_tools.ir_executor.helper import mlir_type_to_dtype
 
-def _torch_dtype_from_str(dtype_name: str) -> torch.dtype:
-    _map = {
-        "float": torch.float,
-        "float16": torch.float16,
-        "float32": torch.float32,
-        "float64": torch.float64,
-        "double": torch.float64,
-        "int": torch.int,
-        "int8": torch.int8,
-        "int16": torch.int16,
-        "int32": torch.int32,
-        "int64": torch.int64,
-        "bool": torch.bool,
-        # TODO: bfloat16, etc.
-    }
-    return _map.get(dtype_name, None)
-
-import numpy as np
-
-def _numpy_dtype_to_str(np_dtype: np.dtype) -> str:
-    _map = {
-        np.single: "float",
-        np.half: "float16",
-        np.float16: "float16",
-        np.float32: "float32",
-        np.float64: "float64",
-        np.double: "double",
-        np.int8: "int8",
-        np.int16: "int16",
-        np.int32: "int32",
-        np.int64: "int64",
-        np.bool_: "bool",
-    }
-    return _map.get(np_dtype, None)
+from byteir.utils import mlir_type_to_torch_str, torch_dtype_from_str
 
 def _init_torch_tensor(AITTensor):
     assert all(map(lambda s: isinstance(s, IntImm), AITTensor.shape()))
     shape_values = [s.value() for s in AITTensor.shape()]
-    return torch.empty(shape_values, dtype=_torch_dtype_from_str(AITTensor.dtype()))
+    return torch.empty(shape_values, dtype=torch_dtype_from_str(AITTensor.dtype()))
 
 
 # TODO: merge common part of ait & bt builder into a base class
@@ -83,19 +51,29 @@ class ait_builder:
         self.ait_module_path = None
         self.ait_model = None
 
+        self.subgraph_name = subgraph_name
         self.workdir = workdir
         self.test_name = "./" + subgraph_name
         self.dll_name = subgraph_name + ".so"
+        self.constants = {}
+        self.constant_idx = 0
         #func = self.module.body.operations[0]
         # init arguments
+        idx = 0
         for i in self.func.arguments:
             shaped_type = ir.ShapedType(i.type)
             shape = shaped_type.shape
-            # TODO: dtype and name here?
-            dtype = mlir_type_to_dtype(shaped_type.element_type)
-            self._value2tensor[i] = Tensor(shape=shape, dtype=_numpy_dtype_to_str(dtype), is_input=True)
+            dtype = mlir_type_to_torch_str(shaped_type.element_type)
+            self._value2tensor[i] = Tensor(shape=shape, dtype=dtype, is_input=True, name=f"input_tensor_{idx}")
             self.inputs.append(self._value2tensor[i])
+            idx += 1
 
+        # Note: variable `lib_path` is constructed according to the code in compile_model()
+        lib_path = os.path.join(self.workdir, self.test_name, self.dll_name,)
+        print("AIT module path {} for {}".format(lib_path, self.dll_name))
+        self.ait_module_path = lib_path
+
+    def compile(self):
         self._visit_block(self.func.entry_block)
         assert self.ait_module_path is not None
         assert self.ait_model is not None
@@ -109,6 +87,15 @@ class ait_builder:
             return
         if hasattr(op, "operands"):
             outputs = AITemplateIRTranslator.translate(op, inputs)
+            if op.operation.name == "mhlo.constant":
+                # TODO: need to support FP16
+                shaped_type = ir.ShapedType(op.result.type)
+                outputs[0]._attrs["name"] = f"const_tensor_{self.constant_idx}"
+                np_array = mlir_attr_to_pyobj(op.attributes["value"])
+                data = torch.from_numpy(np_array).contiguous().cuda()
+                data = data.to(torch_dtype_from_str(mlir_type_to_torch_str(shaped_type.element_type)))
+                self.constants[outputs[0]._attrs["name"]] = data
+                self.constant_idx += 1
             if op.operation.name != "mhlo.constant":
                 for value in op.results:
                     self._im_vals.add(value)
@@ -130,34 +117,29 @@ class ait_builder:
         return self._value2tensor[val]
 
     def _gen_ait_module(self, results):
-        target = detect_target()
+        target = detect_target(use_fp16_acc=False)
         constants = {}
 
         idx = 0
-        for key in self._value2tensor:
-            ait_tensor = self._value2tensor[key]
-            if len(ait_tensor._attrs["src_ops"]) == 0 and not ait_tensor._attrs["is_input"]: # TODO: need a better method here
-                torch_tensor = _init_torch_tensor(ait_tensor)
-                ait_tensor._attrs["name"] = f"const_tensor_{idx}"
-                idx += 1
-                constants[ait_tensor._attrs["name"]] = torch_tensor
-
         for out in results:
             out._attrs["is_output"] = True
+            out._attrs["name"] = f"output_tensor_{idx}"
+            idx += 1
+
         module = compile_model(
             tensor=results,
             target=target,
             workdir=self.workdir,
             test_name=self.test_name,
             dll_name=self.dll_name,
-            constants=constants
+            constants=self.constants
         )
         print("AIT module path {} for {}".format(module.lib_path, self.dll_name))
         self.ait_module_path = module.lib_path
         self.ait_model = module
         self.outputs = results.copy()
 
-    def _gen_runtime_tensor(self, tensor: Tensor, scale=1.0):
+    def _gen_runtime_tensor(self, tensor: Tensor):
         shape = tensor.shape()
         rt_shape = []
         for s in shape:
@@ -165,13 +147,21 @@ class ait_builder:
                 rt_shape.append(s.value())
             elif isinstance(s, IntVar):
                 rt_shape.append(random.choice(s._attrs["values"]))
-        return torch.randn(*rt_shape).cuda().to(_torch_dtype_from_str(tensor.dtype())) * scale
+        dtype = torch_dtype_from_str(tensor.dtype())
+        if len(rt_shape) == 0:
+            return torch.tensor(1).to(torch_dtype_from_str(tensor.dtype())).cuda()
+        if dtype == torch.bool:
+            return torch.randint(high=1, size=rt_shape, dtype=dtype, device="cuda")
+        elif dtype in [torch.int8, torch.int, torch.int16, torch.int32, torch.int64]:
+            return torch.randint(high=100, size=rt_shape, dtype=dtype, device="cuda")
+        else:
+            return torch.randn(*rt_shape, device="cuda").to(torch_dtype_from_str(tensor.dtype()))
 
-    def execute(self, np_inputs, num_trials=1, benchmark=False, scale=1.0):
+    def execute(self, np_inputs, num_trials=1, benchmark=False):
         rt_inputs = {}
         rt_outputs = {}
         for np_input, in_tensor in zip(np_inputs, self.inputs):
-            rt_inputs[in_tensor._attrs["name"]] = torch.from_numpy(np_input).contiguous().cuda().to(_torch_dtype_from_str(in_tensor.dtype())) * scale
+            rt_inputs[in_tensor._attrs["name"]] = torch.from_numpy(np_input).contiguous().cuda().to(torch_dtype_from_str(in_tensor.dtype()))
         for out_tensor in self.outputs:
             rt_outputs[out_tensor._attrs["name"]] = self._gen_runtime_tensor(out_tensor)
         self.ait_model.run_with_tensors(inputs=rt_inputs, outputs=rt_outputs)

@@ -201,7 +201,14 @@ def GraphClusteringByDevice : Pass<"graph-clustering-by-device", "ModuleOp"> {
     Option<"dupNonSplat", "dup-non-splat", "bool", /*default=*/"false",
            "duplicate a non-splat const if it is used by both host and device side.">,
     Option<"dupOutputs", "dup-outputs", "bool", /*default=*/"false",
-           "duplicate a return value in the internal function if it is returned multiple times in main.">
+           "duplicate a return value in the internal function if it is returned multiple times in main.">,
+    Option<"clusterAlgo", "cluster-algo", "::mlir::GraphClusteringAlgo", /*default=*/"::mlir::GraphClusteringAlgo::kFallback",
+           "The clustering algorithm",
+           [{llvm::cl::values(
+              clEnumValN(mlir::GraphClusteringAlgo::kFallback, "Fallback", "Fallback clustering algorithm"),
+              clEnumValN(mlir::GraphClusteringAlgo::kTopDown, "TopDown", "Create and merge device cluster progressively from top to bottom"),
+              clEnumValN(mlir::GraphClusteringAlgo::kBottomUp, "BottomUp", "Create and merge device cluster progressively from bottom to top")
+            )}]>
   ];
 }
 
@@ -219,8 +226,8 @@ def LoopTag : Pass<"loop-tag", "func::FuncOp"> {
     Option<"attachAttr", "attach-attr", "std::string",
             /*default=*/"",
             "An optional attribute attaching on target functions: <attr_name>:<type>:<value>">,
-    Option<"depth", "depth", "unsigned", /*default=*/"1",
-           "Use this depth factor to specify loop">,
+    Option<"depth", "depth", "int", /*default=*/"1",
+           "Use this depth factor to specify loop, -1 is last">,
     Option<"loopType", "loop-type", "std::string",
             /*default=*/"\"scf.for\"",
             "An optional name to specify loop type.">
@@ -241,6 +248,8 @@ def MemoryPlanning: Pass<"memory-planning", "mlir::func::FuncOp"> {
            "Memory address alignment, must be power of 2">,
     Option<"alloca", "alloca", "bool", /*default=*/"false",
            "Whether to planning on memref.alloca ops">,
+    Option<"memSpace", "mem-space", "size_t", /*default=*/"0",
+           "Memory space considered in planning. 0 indicates all spaces.">,
   ];
 }
 

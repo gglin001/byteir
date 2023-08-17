@@ -21,10 +21,13 @@
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
 
 using namespace mlir;
 using namespace mlir::linalg_ext;
@@ -239,6 +242,9 @@ FailureOr<TilingResult> mlir::commonGenerateResultTileValue(
   FailureOr<mlir::TilingResult> tileResult =
       tilingInterfaceOp.getTiledImplementation(b, iterationTileOffsets,
                                                iterationTileSizes);
+  if (failed(tileResult)) {
+    return op->emitOpError("failed to generate tiled implementation");
+  }
   SmallVector<Operation *> tiledOp = tileResult->tiledOps;
   if (tiledOp.size() != 1)
     return op->emitOpError("failed to generate tiled implementation");

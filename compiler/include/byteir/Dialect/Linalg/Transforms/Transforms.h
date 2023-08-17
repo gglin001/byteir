@@ -34,6 +34,7 @@
 #ifndef BYTEIR_DIALECT_LINALG_TRANSFORMS_TRANSFORMS_H
 #define BYTEIR_DIALECT_LINALG_TRANSFORMS_TRANSFORMS_H
 
+#include "byteir/Utils/TileUtils.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -48,6 +49,11 @@ namespace mlir {
 class DominanceInfo;
 class PostDominanceInfo;
 
+using TileFuncType = std::function<LogicalResult(
+    RewriterBase &rewriter, TilingInterface op, ArrayRef<OpFoldResult> tileNums,
+    ArrayRef<int64_t> interchange, ArrayRef<bool> useDistributdStyle,
+    scf::SCFTileAndFuseResult &tileAndFuseResult)>;
+
 namespace scf {
 /// tileConsumerAndFuseProducerUsingSCFForOpExt is an enhanced version
 /// tileConsumerAndFuseProducerGreedilyUsingSCFForOp.
@@ -56,6 +62,17 @@ tileConsumerAndFuseProducerUsingSCFForOpExt(
     RewriterBase &rewriter, TilingInterface consumer,
     ArrayRef<Operation *> stopOps, const scf::SCFTileAndFuseOptions &options,
     bool simplifyLoopIter = true, bool keepIntermediate = false);
+
+/// @brief  This is an enhancement version of upstream's
+/// tileConsumerAndFuseProducerGreedilyUsingSCFFor to tile & fuse multiple root
+/// @param tensors the roots of the tile & fuse procedure
+/// @param expectWholeGraphFusion if set True, return failure() if a whole graph
+/// tile & fuse cannot be performed
+FailureOr<scf::SCFTileAndFuseResult>
+tileConsumerArrayAndFuseProducerGreedilyUsingSCFFor(
+    RewriterBase &rewriter, ArrayRef<Value> tensors,
+    const TilingOptions &options, TileFuncType tileFunc = nullptr,
+    bool expectWholeGraphFusion = false);
 
 void labelTileLoopType(Operation *op, ArrayRef<scf::ForOp> loops);
 
@@ -76,7 +93,7 @@ bool isProducerElementwiseOpFusable(OpOperand *consumerOpOperand);
 /// Rewrite a fusion pattern of an elementwise consumer with elementwise
 /// producers
 void populateElementwiseOpsProducerConsumerFusionPatterns(
-    RewritePatternSet &patterns,
+    RewritePatternSet &patterns, bool diffShape,
     const linalg::ControlFusionFn &controlElementwiseOpFusion,
     DominanceInfo &dom, PostDominanceInfo &post);
 

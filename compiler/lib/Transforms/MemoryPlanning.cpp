@@ -61,7 +61,8 @@ size_t computeUserangeSize(const UseInterval &interval) {
 /// Compute the byte size of a given Value.
 size_t computeByteSize(const Value &v) {
   auto type = v.getType().cast<ShapedType>();
-  return (type.getSizeInBits() + 7) >> 3;
+  auto dtypeSize = (type.getElementTypeBitWidth() + 7) >> 3;
+  return dtypeSize * type.getNumElements();
 }
 
 /// Compute the \p alignment byte alinged segments of a given Value.
@@ -524,12 +525,30 @@ struct MemoryPlanningPass : public MemoryPlanningBase<MemoryPlanningPass> {
   void runOnOperation() override {
     // use the buffer packing algorithm which mostly refers to the
     // implementation of mhlo
+    std::function<bool(Value)> callback = this->couldReuseAllocation;
+    if (this->memSpace > 0) {
+      // if specified the memSpace, only consider the given memSpace
+      callback = [&](Value v) {
+        if (this->couldReuseAllocation && !this->couldReuseAllocation(v))
+          return false;
+        if (auto memType = v.getType().dyn_cast<MemRefType>()) {
+          if (auto space = memType.getMemorySpace()) {
+            if (auto asInt = space.dyn_cast<IntegerAttr>()) {
+              if (asInt.getInt() == (int)this->memSpace) {
+                return true;
+              }
+            }
+          }
+        }
+        return false;
+      };
+    }
     if (this->alloca) {
       buffer_packing::doBufferPacking<memref::AllocaOp>(
-          getOperation(), this->alignment, this->couldReuseAllocation);
+          getOperation(), this->alignment, callback);
     } else {
       buffer_packing::doBufferPacking<memref::AllocOp>(
-          getOperation(), this->alignment, this->couldReuseAllocation);
+          getOperation(), this->alignment, callback);
     }
     // TODO: other memory planning algorithm
   }

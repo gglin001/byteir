@@ -68,6 +68,15 @@ def ConvForwardFusion : Pass<"fuse-conv-forward", "mlir::func::FuncOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Convert Rng To CustomCall
+//===----------------------------------------------------------------------===//
+
+def ConvertOpToCustomCall : Pass<"convert-op-to-customcall", "mlir::func::FuncOp"> {
+  let summary = "Convert op to mhlo.custom_call";
+  let constructor = "mlir::createConvertOpToCustomCallPass()";
+}
+
+//===----------------------------------------------------------------------===//
 // ConvertFuncToCustomCall // No command-line
 //===----------------------------------------------------------------------===//
 
@@ -271,6 +280,15 @@ def LayoutTransformation : Pass<"transform-layout", "mlir::func::FuncOp"> {
 def ReduceFusion : Pass<"fuse-reduce", "mlir::func::FuncOp"> {
   let summary = "Fuse reduce and reduce-window ops";
   let constructor = "mlir::createReduceFusionPass()";
+}
+
+//===----------------------------------------------------------------------===//
+// ReshapeGather
+//===----------------------------------------------------------------------===//
+
+def ReshapeGather : Pass<"reshape-gather", "mlir::func::FuncOp"> {
+  let summary = "Reshape gather index to be 1D";
+  let constructor = "mlir::createReshapeGatherPass()";
 }
 
 //===----------------------------------------------------------------------===//
