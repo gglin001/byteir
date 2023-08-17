@@ -244,7 +244,7 @@ struct ConvOrDotWithBiasFollowedByBroadcastPattern<
       return failure();
 
     Operation *convOrDotOrBiasUser = *convOrDotOrBiasOut.user_begin();
-    uint64_t weightFeatureDim = 1;
+    auto weightFeatureDim = 1;
     int64_t featureDim = 1;
     static_assert(
         llvm::is_one_of<OpTy, mhlo::ConvolutionOp, mhlo::DotOp>::value &&
@@ -512,8 +512,8 @@ struct HloFolderPass : public HloFolderBase<HloFolderPass> {
 
 void mlir::populateHloFoldPatterns(RewritePatternSet &patterns) {
   // clang-format off
-  patterns.add<AddScatterAddToScatterPattern, 
-               PadConvToConvPattern, 
+  patterns.add<AddScatterAddToScatterPattern,
+               PadConvToConvPattern,
                PadReduceWindowToReduceWindowPattern,
                ConvOrDotWithBiasFollowedByBroadcastPattern<mhlo::ConvolutionOp>,
                ConvOrDotWithBiasFollowedByBroadcastPattern<mhlo::DotOp>>(
