@@ -49,3 +49,4 @@ local_test*
 
 /llvm-build/
 .cache/
+t.sh
