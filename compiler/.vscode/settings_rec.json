@@ -1,0 +1,22 @@
+{
+    "cmake.sourceDirectory": "${workspaceFolder}/cmake",
+    "cmake.configureSettings": {
+        "CMAKE_INSTALL_PREFIX": "${workspaceFolder}/build/install",
+        // "LLVM_INSTALL_PATH": "/repos/gglin001/byteir/llvm-build",
+        "LLVM_INSTALL_PATH": "${workspaceFolder}/llvm-build",
+        // pip install lit
+        "LLVM_EXTERNAL_LIT": "${env:CONDA_PREFIX}/bin/lit",
+        "Python3_EXECUTABLE": "${env:CONDA_PREFIX}/bin/python",
+        // "BYTEIR_INCLUDE_TESTS": "OFF",
+        "BYTEIR_INCLUDE_TESTS": "ON",
+        "BYTEIR_ENABLE_BINDINGS_PYTHON": "ON",
+        "CUSTOM_PATH": "${env:CUSTOM_PATH}",
+    },
+    "terminal.integrated.env.linux": {
+        // "PATH": "${workspaceFolder}/build/bin:${env:PATH}",
+        "PYTHONPATH": "${workspaceFolder}/build/python_packages/byteir:${env:PYTHONPATH}",
+        "CUSTOM_PATH": "${workspaceFolder}"
+    },
+    // "C_Cpp.intelliSenseEngine": "default",
+    // "C_Cpp.intelliSenseCachePath": "${workspaceFolder}/build/.vsc_cpp_cache",
+}

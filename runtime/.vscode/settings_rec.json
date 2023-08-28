@@ -1,0 +1,25 @@
+{
+    "cmake.sourceDirectory": "${workspaceFolder}/cmake",
+    "cmake.configureSettings": {
+        "CMAKE_INSTALL_PREFIX": "${workspaceFolder}/build/install",
+        // pip install lit
+        "LLVM_INSTALL_PATH": "${workspaceFolder}/llvm-build",
+        // "LLVM_INSTALL_PATH": "${workspaceFolder}/llvm-build/install",
+        // "LLVM_EXTERNAL_LIT": "${env:CONDA_PREFIX}/bin/lit",
+        "Python3_EXECUTABLE": "${env:CONDA_PREFIX}/bin/python",
+        "BYTEIR_INCLUDE_TESTS": "ON",
+        "brt_USE_CUDA": "ON",
+        // "brt_USE_CUDA": "OFF",
+        "CUDA_TOOLKIT_ROOT_DIR": "/cache/cuda_118",
+        "CUDAToolkit_ROOT": "/cache/cuda_118",
+        "brt_ENABLE_PYTHON_BINDINGS": "ON",
+        "brt_BUILD_UNIT_TESTS": "ON",
+    },
+    "terminal.integrated.env.linux": {
+        // "PATH": "${workspaceFolder}/build/bin:${workspaceFolder}/llvm-build/bin:${env:PATH}",
+        // "LD_LIBRARY_PATH": "${workspaceFolder}/build/lib:${env:LD_LIBRARY_PATH}",
+        "LD_LIBRARY_PATH": "${workspaceFolder}/build/lib:${env:LD_LIBRARY_PATH}",
+    },
+    // "C_Cpp.intelliSenseEngine": "default",
+    // "C_Cpp.intelliSenseCachePath": "${workspaceFolder}/build/.vsc_cpp_cache",
+}
