@@ -6,7 +6,7 @@
 
 # cuda torch and torchvision
 # --extra-index-url https://download.pytorch.org/whl/nightly/cu118
---extra-index-url https://mirror.sjtu.edu.cn/pytorch-wheels/nightly/cu118
+# --extra-index-url https://mirror.sjtu.edu.cn/pytorch-wheels/nightly/cu118
 # --pre
 # torch==2.1.0.dev20230820+cu118
 # torchvision==0.16.0.dev20230820+cu118

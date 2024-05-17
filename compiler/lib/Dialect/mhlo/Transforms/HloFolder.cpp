@@ -610,8 +610,8 @@ struct HloFolderPass : public HloFolderBase<HloFolderPass> {
 
 void mlir::populateHloFoldPatterns(RewritePatternSet &patterns) {
   // clang-format off
-  patterns.add<AddScatterAddToScatterPattern,
-               PadConvToConvPattern,
+  patterns.add<AddScatterAddToScatterPattern, 
+               PadConvToConvPattern, 
                PadReduceWindowToReduceWindowPattern,
                ConvOrDotWithBiasFollowedByBroadcastPattern<mhlo::ConvolutionOp>,
                ConvOrDotWithBiasFollowedByBroadcastPattern<mhlo::DotOp>>(

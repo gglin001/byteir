@@ -232,7 +232,7 @@ public:
 
   // TODO confirm API with services
 #if 0
-  virtual common::Status Init(const std::vector<int>& feed_mlvalue_idxs,
+  virtual common::Status Init(const std::vector<int>& feed_mlvalue_idxs, 
             const std::vector<AsyncValueRef>& feeds,
             const std::unordered_map<int, AsyncValue>& initializers,
             const std::vector<AsyncValue>& fetches) = 0;
