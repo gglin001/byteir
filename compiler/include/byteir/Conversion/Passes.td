@@ -44,21 +44,6 @@ def GPUToNVVMExt : Pass<"gpu-to-nvvm-ext", "gpu::GPUModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
-// HloToLHlo
-//===----------------------------------------------------------------------===//
-
-def ConvertHloToLHlo : Pass<"convert-hlo-to-lhlo", "ModuleOp"> {
-  let summary = "An extension to convert hlo to lhlo Op.";
-  let constructor = "mlir::createConvertHloToLHloPass()";
-  let dependentDialects = [
-    "mlir::lmhlo::LmhloDialect",
-    "mlir::memref::MemRefDialect",
-    "mlir::shape::ShapeDialect",
-    "mlir::bufferization::BufferizationDialect",
-  ];
-}
-
-//===----------------------------------------------------------------------===//
 // ToLinalg
 //===----------------------------------------------------------------------===//
 
@@ -99,27 +84,6 @@ def TensorToLinalg : Pass<"tensor-to-linalg", "func::FuncOp"> {
 def LinalgExtToLinalg : Pass<"linalg-ext-to-linalg", "func::FuncOp"> {
   let summary = "Convert LinalgExt ops to Linalg";
   let constructor = "mlir::createLinalgExtToLinalgPass()";
-}
-
-//===----------------------------------------------------------------------===//
-// LmhloToLace
-//===----------------------------------------------------------------------===//
-
-def LmhloToLace : Pass<"lmhlo-to-lace", "func::FuncOp"> {
-  let summary = "Convert from Lmhlo Dialect to Lace Dialect.";
-  let constructor = "mlir::createLmhloToLacePass()";
-  let dependentDialects = [
-    "mlir::lace::LaceDialect",
-  ];
-}
-
-//===----------------------------------------------------------------------===//
-// LmhloToMemref
-//===----------------------------------------------------------------------===//
-
-def LmhloToMemref : Pass<"lmhlo-to-memref", "func::FuncOp"> {
-  let summary = "Convert from Lmhlo Dialect to MemRef Dialect.";
-  let constructor = "mlir::createLmhloToMemrefPass()";
 }
 
 //===----------------------------------------------------------------------===//
@@ -217,20 +181,6 @@ def ConvertFuncAndCallToByre : Pass<"convert-func-and-call-to-byre", "ModuleOp">
   ];
 }
 
-def ConvertLmhloToByre : Pass<"convert-lmhlo-to-byre", "func::FuncOp"> {
-  let summary = "Convert lmhlo to Byre";
-  let constructor = "mlir::createConvertLmhloToByrePass()";
-  let dependentDialects = [
-    "mlir::byre::ByreDialect",
-    "mlir::memref::MemRefDialect",
-  ];
-  let options = [
-    Option<"appendArgTypes", "append-arg-types", "bool", /*default=*/"false",
-           "append arg types to Byre">,
-  ];
-
-}
-
 //===----------------------------------------------------------------------===//
 // ToPTX or CUDA
 //===----------------------------------------------------------------------===//
@@ -253,6 +203,9 @@ def CollectGPUKernel : Pass<"collect-gpu-kernel", "ModuleOp"> {
     Option<"moduleName", "module-name", "std::string",
             /*default=*/"\"unified\"",
             "Optional name for GPUModule to put all gpu kernels">,
+    Option<"removeHost", "remove-host", "bool",
+            /*default=*/"true",
+            "Whether to remove host part">,
   ];
 }
 
@@ -320,7 +273,8 @@ def ConvertHloToByreTensor : Pass<"hlo-to-byre-tensor", "func::FuncOp"> {
   let dependentDialects = [
     "mlir::arith::ArithDialect",
     "mlir::byre::ByreDialect",
-    "mlir::tensor::TensorDialect"
+    "mlir::tensor::TensorDialect",
+    "mlir::shape::ShapeDialect",
   ];
 
   let options = [
@@ -338,8 +292,10 @@ def ConvertFuncToByreTensor : Pass<"func-to-byre-tensor", "ModuleOp"> {
   let summary = "Convert func op to byre tensor compute op.";
   let constructor = "mlir::createConvertFuncToByreTensorPass()";
   let dependentDialects = [
+    "mlir::arith::ArithDialect",
     "mlir::byre::ByreDialect",
-    "mlir::tensor::TensorDialect"
+    "mlir::tensor::TensorDialect",
+    "mlir::shape::ShapeDialect",
   ];
 
   let options = [
@@ -348,6 +304,26 @@ def ConvertFuncToByreTensor : Pass<"func-to-byre-tensor", "ModuleOp"> {
   ];
 }
 
+
+//===----------------------------------------------------------------------===//
+// FuncToByreTensor
+//===----------------------------------------------------------------------===//
+
+def ConvertGPULaunchFuncToByre : Pass<"gpu-launch-func-to-byre"> {
+  let summary = "Convert gpu.launch_func op to byre compute op.";
+  let constructor = "mlir::createConvertGPULaunchFuncToByrePass()";
+  let dependentDialects = [
+    "mlir::byre::ByreDialect",
+    "mlir::gpu::GPUDialect"
+  ];
+
+  let options = [
+    Option<"useBarePtrCallConv", "use-bare-ptr-memref-call-conv", "bool",
+          /*default=*/"false",
+          "Replace memref arguments in GPU functions with bare pointers."
+          "All memrefs must have static shape">,
+  ];
+}
 
 //===----------------------------------------------------------------------===//
 // MemrefToByre
@@ -398,6 +374,22 @@ def MemrefCopyToLinalgPass :
     Option<"attachAttr", "attach-attr", "std::string",
             /*default=*/"",
             "An optional unit attribute attaching on target functions: <attr_name>">,
+    Option<"outlining", "outlining", "bool",
+            /*default=*/"true",
+            "Whether to outline the copy op to a new function">,
+  ];
+}
+
+//===----------------------------------------------------------------------===//
+// LcclToByre
+//===----------------------------------------------------------------------===//
+
+def ConvertLcclToByre : Pass<"lccl-to-byre", "func::FuncOp"> {
+  let summary = "Convert lccl op to byre op.";
+  let constructor = "mlir::createConvertLcclToByrePass()";
+  let dependentDialects = [
+    "mlir::byre::ByreDialect",
+    "mlir::lccl::LcclDialect"
   ];
 }
 

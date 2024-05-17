@@ -52,7 +52,7 @@ def RewriteToCustomCallOps: Pass<"rewrite-to-custom-call", "ModuleOp"> {
                "Operations to be wrapped",
                "llvm::cl::ZeroOrMore">,
     Option<"keepBody", "keep-body", "bool", /*default=*/"false",
-           "keep func body">,	
+           "keep func body">,
   ];
   let dependentDialects = [
     "mlir::TF::TensorFlowDialect",
@@ -101,6 +101,30 @@ def RewriteFuncAttrToByteIR: Pass<"rewrite-func-attr-to-byteir", "func::FuncOp">
   let summary = "rewrite function attributes to byteir function attributes";
   let constructor = "mlir::tfext::createRewriteFuncAttrToByteIRPass()";
   let dependentDialects = [];
+}
+
+def TFSwitchMergeToIf : Pass<"tf-switch-merge-to-if", "func::FuncOp"> {
+  let summary = "transform merge and switch to TF.If";
+  let constructor = "mlir::tfext::createTFSwitchMergeToIfPass()";
+}
+
+def RemoveCstrReshapable : Pass<"remove-cstr-reshapable", "func::FuncOp"> {
+  let summary = "replace cstr_reshapable to true";
+  let constructor = "mlir::tfext::createRemoveCstrReshapablePass()";
+}
+
+def ConvertRepeatToTile : Pass<"convert-repeat-to-tile", "func::FuncOp"> {
+  let summary = "convert repeat to tile + reshape";
+  let constructor = "mlir::tfext::createConvertRepeatToTilePass()";
+}
+
+def SetRepeatOutBatchSize : Pass<"set-repeat-out-batch-size", "func::FuncOp"> {
+  let summary = "set repeat out batch size";
+  let constructor = "mlir::tfext::createSetRepeatOutBatchSizePass()";
+  let options = [
+    Option<"repeatOutBatchSize", "repeat-out-batch-size", "int64_t", /*default=*/"-1",
+           "batch size of repeat output tensor">,
+  ];
 }
 
 #endif // TF_MLIR_EXT_PASSES

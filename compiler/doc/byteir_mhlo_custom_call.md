@@ -2,15 +2,15 @@
 
 ByteIR compiler introduces several coarse-grained ops to improve pattern-matching rewriting during compilation.
 
-ByteIR implements in the way of re-using mhlo custom call op definition with a ByteIR prefix in `call_target_name`, 
+ByteIR implements in the way of re-using mhlo custom call op definition with a ByteIR prefix in `call_target_name`,
 instead of defining another new dialect.
 
 ByteIR implements this conversion in frontends, instead of puting it to ByteIR compiler.
 
-## Rationales 
+## Rationales
 ### Need of coarse-grained ops
 
-Introduction of coarse-grained ops can provide several benefits as follows, 
+Introduction of coarse-grained ops can provide several benefits as follows,
 * it simplifies pattern-matching processes during rewriting regardless of optimization or lowering;
 * it allows high-level information to be encoded with coase-grained ops, helping optimization;
 * it provides intuitive mapping from frontends to IR, helping debuggability;
@@ -33,28 +33,30 @@ Implementing coarse-grained op conversion in frontends can provide several benef
 
 ## Addtional op definition
 
-A coarse-grained op kind is defined through with a prefix. 
+A coarse-grained op kind is defined through with a prefix.
 
 ```call_target_name = "byteir.softmax" or "tf.DynamicPartition"```
 
 If an op is generic across frontends, which happen mostly, it uses a `byteir` prefix.
 If an op is frontend-specific, it uses a frontend-specific prefix, such as `tf` or `pytorch`.
 
-Further needed infomation for a given coarse-grained op are encoded in a dictionary attribute, called `byteir_attrs`, which includes all named attributes. 
+Further needed infomation for a given coarse-grained op are encoded in a dictionary attribute, called `byteir_attrs`, which includes all named attributes.
 
-```Op Attribute: byteir_attrs = {approximate = "none"} or byteir_attrs = {} of if none```
+**Op Attribute**:
+  * ```byteir_attrs = {approximate = "none"}``` or ```byteir_attrs = {}``` if no attribute
+  * ```axis``` attribute must be positive
 
 ### byteir.layer_norm
 - Operands:
   - input: Tensor
-  - weight: Tensor
-  - bias: Tensor
+  - weight: Tensor (shape should be same as axis of input tensor)
+  - bias: Tensor (shape should be same as axis of input tensor)
 - Attrs
   - epsilon: F64Attr
   - axis: I64ArrayAttr
   - eps_outside_sqrt: Optional\<BoolAttr>
 - Results(1 or 3):
-  - output: Tensor 
+  - output: Tensor
   - mean: Optional\<Tensor>
   - inv_std_dev: Optional\<Tensor>
 
@@ -63,6 +65,7 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
   - input: Tensor
 - Attrs
   - epsilon: F64Attr
+  - eps_outside_sqrt: Optional\<BoolAttr>
   - axis: I64ArrayAttr
 - Results:
   - output: Tensor
@@ -114,10 +117,10 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
   - select_last_index: BoolAttr
 - Results:
   - output: Optional\<Tensor>
-  - indices: IntTensor 
+  - indices: IntTensor
 
 
-### byteir.top_k 
+### byteir.top_k
 - Operands:
   - input: Tensor
 - Attrs
@@ -128,7 +131,7 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
   - output: Tensor
   - indices: IntTensor
 
-### byteir.erf 
+### byteir.erf
 - Operands:
   - input: Tensor
 - Results:
@@ -137,6 +140,12 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
 ```
 %0 = "mhlo.custom_call"(%arg0) {call_target_name = "byteir.erf", has_side_effect = false} : (tensor<?x64xf32>) -> tensor<?x64xf32>
 ```
+
+### byteir.addn
+- Operands:
+  - inputs: Variadic\<Tensor>
+- Results:
+  - outputs: Tensor
 
 ### byteir.one_hot
 - Operands:
@@ -149,23 +158,38 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
 - Results:
   - output: Tensor (ElementType same as on_value and off_value)
 
+### byteir.repeat
+- Operands:
+  - input: Tensor
+  - repeats: Int32/Int64 Tensor
+- Results:
+  - output: Tensor (ElementType same as input)
+
+### byteir.non_zero
+- Operands:
+  - input: Tensor
+- Reults:
+  - output: Int32/Int64/Index Tensor
+
+Semantics: see https://pytorch.org/docs/stable/generated/torch.nonzero.html
+
 ### byteir.quantize
 - Operands:
   - input: FloatTensor
   - scale: FloatTensor (rank=0 for per-tensor quantization, or rank=1 for per-channel quantization)
-  - zero_point: Int8Tensor (shape same as scale)
+  - zero_point: Int8/Int16/Uint8/Uint16 Tensor (shape same as scale)
 - Attrs
-  - axis: I64Attr (Optional, required only for per-channel quantization)
+  - axis: Optional\<I64Attr> (required only for per-channel quantization)
 - Results:
-  - output: Int8Tensor
+  - output: Int8/Int16/Uint8/Uint16 Tensor (type same as zero_point)
 
 ### byteir.dequantize
 - Operands:
-  - input: Int8Tensor
+  - input: Int8/Int16/Uint8/Uint16 Tensor
   - scale: FloatTensor (rank=0 for per-tensor dequantization, or rank=1 for per-channel dequantization)
-  - zero_point: Int8Tensor (shape same as scale)
+  - zero_point: Int8/Int16/Uint8/Uint16 Tensor (shape same as scale, type same as input)
 - Attrs
-  - axis: I64Attr (Optional, channel axis index, required only for per-channel dequantization)
+  - axis: Optional\<I64Attr> (channel axis index, required only for per-channel dequantization)
 - Results:
   - output: FloatTensor
 
@@ -208,7 +232,7 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
 %high = mhlo.constant dense<1.000000e+00> : tensor<f32>
 %low = mhlo.constant dense<0.000000e+00> : tensor<f32>
 %seed = byre.compute @GetSeed() : tensor<i64>
-%offset = byre.compute @GetOffset() : tensor<i64>
+%offset = byre.compute @NextOffset() : tensor<i64>
 %0 = "mhlo.custom_call"(%low, %high, %seed, %offset) {call_target_name = "byteir.rng_uniform", has_side_effect = false} : (tensor<f32>, tensor<f32>, tensor<i64>, tensor<i64>) -> tensor<8x1024x768xf32>
 ```
 ```
@@ -216,7 +240,43 @@ Further needed infomation for a given coarse-grained op are encoded in a diction
 %high = mhlo.constant dense<1.000000e+00> : tensor<f32>
 %low = mhlo.constant dense<0.000000e+00> : tensor<f32>
 %seed = byre.compute @GetSeed() : tensor<i64>
-%offset = byre.compute @GetOffset() : tensor<i64>
+%offset = byre.compute @NextOffset() : tensor<i64>
 %shape = shape.shape_of %arg0 : tensor<3xindex>
 %0 = "mhlo.custom_call"(%low, %high, %seed, %offset, %shape) {call_target_name = "byteir.rng_uniform", has_side_effect = false} : (tensor<f32>, tensor<f32>, tensor<i64>, tensor<i64>, tensor<3xindex>) -> tensor<?x?x?xf32>
 ```
+
+### byteir.flash_attn_fwd
+- Operands:
+  - q: Tensor
+  - k: Tensor
+  - v: Tensor
+- Attrs:
+  - dropout_p: FloatAttr
+  - softmax_scale: FloatAttr
+  - causal: BoolAttr
+  - return_softmax: BoolAttr
+- Results:
+  - output: Tensor
+  - softmax_lse: Tensor
+  - softmax_return: Tensor
+  - rng: Tensor
+
+### byteir.flash_attn_bwd
+- Operands:
+  - dout: Tensor
+  - q: Tensor
+  - k: Tensor
+  - v: Tensor
+  - out: Tensor
+  - softmax_lse: Tensor
+  - rng_state: Tensor
+- Attrs:
+  - dropout_p: FloatAttr
+  - softmax_scale: FloatAttr
+  - causal: BoolAttr
+- Results:
+  - dq: Tensor
+  - dk: Tensor
+  - dv: Tensor
+  - d_softmax: Tensor
+  - dq_accum: Tensor

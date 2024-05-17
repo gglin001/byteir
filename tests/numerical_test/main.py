@@ -16,9 +16,11 @@
 import argparse
 import os
 import re
+import numpy as np
 from execute import compile_and_run_mlir, compile_and_run_torch
 from torch_e2e_testing.registry import GLOBAL_TORCH_TEST_REGISTRY
 from torch_e2e_testing.test_suite import register_all_torch_tests
+from torch_dynamo_e2e_testing.execute import run_torch_dynamo_tests
 from utils import report_results
 import sys
 from subprocess import PIPE, Popen
@@ -28,21 +30,32 @@ parser.add_argument("-f", "--filter", default=".*", help="""
 Regular expression specifying which tests to include in this run.
 """)
 parser.add_argument("--target", type=str, default="cuda_with_ait",
-                    choices=["ait", "cuda", "cuda_with_ait_aggressive"], help="target device name")
+                    choices=["ait", "cuda_with_ait", "cuda", "cuda_with_ait_aggressive", "cpu"], help="target device name")
 parser.add_argument("-c", "--config", default="all",
-                    choices=["all", "mlir", "torch"], help="test sets to run.")
+                    choices=["all", "mlir", "torch", "dynamo"], help="test sets to run.")
 args = parser.parse_args()
 
 EXCLUDE_MLIR_TESTS = []
 
+# Unsupported ops
+EXCLUDE_MLIR_CPU_TESTS = [
+    "custom_call_tf_UpperBound.mlir",
+    "rng.mlir",
+]
+
 EXCLUDE_TORCH_TESTS = []
+
+MLIR_CPU_SPECIAL_INPUTS = {
+    "log_plus_one.mlir" : ["uniform", 0.5, 1.0],
+}
 
 SM80_PLUS_TESTS = [
     "dot_f32.mlir",
-    "MatmulF32Module_basic",
-    "bmm_rrr_add_f32.mlir",
-    "bmm_rrr_f32.mlir",
+    "bmm_rrr_permute_f16.mlir",
     "bmm_rrr_permute_f32.mlir",
+    "MatmulF32Module_basic",
+    "BatchMatmulAddF32Module_basic",
+    "BatchMatmulF32Module_basic",
 ]
 
 
@@ -58,7 +71,7 @@ def _detect_cuda_with_nvidia_smi():
         sm_names = {
             70: ["V100"],
             75: ["T4", "Quadro T2000"],
-            80: ["PG509", "A100", "A10", "RTX 30", "A30", "RTX 40"],
+            80: ["PG509", "A100", "A10", "RTX 30", "A30", "RTX 40", "A16"],
             90: ["H100"],
         }
         for sm, names in sm_names.items():
@@ -93,6 +106,29 @@ def run_mlir_test(arch):
         results.append(compile_and_run_mlir(test, args.target))
     return results
 
+def run_mlir_cpu_test():
+    directory = os.path.dirname(os.path.realpath(__file__))
+    directory = directory + "/mlir_tests/cpu_ops"
+    cpu_target = "cpu"
+    mlir_tests = []
+
+    for filename in os.listdir(directory):
+        if filename.startswith('.'):
+            continue
+        f = os.path.join(directory, filename)
+        # checking if it is a file
+        if os.path.isfile(f) and re.match(args.filter, filename):
+            if filename not in EXCLUDE_MLIR_CPU_TESTS:
+                mlir_tests.append([f, MLIR_CPU_SPECIAL_INPUTS[filename] if filename in MLIR_CPU_SPECIAL_INPUTS else None])
+
+    results = []
+    for test in mlir_tests:
+        if test[1] is None:
+            results.append(compile_and_run_mlir(test[0], cpu_target))
+        else:
+            results.append(compile_and_run_mlir(test[0], cpu_target, mode=test[1][0], low=test[1][1], high=test[1][2]))
+
+    return results
 
 def run_torch_test(arch):
     tests = [
@@ -113,11 +149,19 @@ def main():
     assert (arch != None)
     if args.config == 'all':
         results = run_mlir_test(arch)
+        results = results + run_mlir_cpu_test()
         results = results + run_torch_test(arch)
+        run_torch_dynamo_tests(arch)
+    elif args.config == 'mlir' and args.target == "cpu":
+        results = run_mlir_cpu_test()
     elif args.config == 'mlir':
         results = run_mlir_test(arch)
     elif args.config == 'torch':
         results = run_torch_test(arch)
+    elif args.config == 'dynamo':
+        # TODO(zzk): use test infra for dynamo tests
+        run_torch_dynamo_tests(arch)
+        pass
     failed = report_results(results)
     sys.exit(1 if failed else 0)
 

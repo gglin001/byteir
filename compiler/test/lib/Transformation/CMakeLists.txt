@@ -1,6 +1,6 @@
 # Exclude tests from libMLIR.so
 add_mlir_library(ByteIRTestTransformation
-  TestMhloCanonicalizeExt.cpp
+  TestByreSerialRoundtrip.cpp
   TestConvertFuncToCustomCall.cpp
   TestConvertInsertion.cpp
   TestDTypeConversion.cpp
@@ -11,5 +11,6 @@ add_mlir_library(ByteIRTestTransformation
   LINK_LIBS PUBLIC
   ByteIRMhloPasses
   ByteIRUtils
+  MLIRByreSerialization
   MhloDialect
   )

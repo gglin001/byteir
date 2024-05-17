@@ -1,15 +1,10 @@
-set(LLVM_TARGET_DEFINITIONS FuseOpOnTorchPattern.td)
-mlir_tablegen(FuseOpOnTorchPattern.inc -gen-rewriters)
-add_public_tablegen_target(FuseOpOnTorchPatternIncGen)
-
 add_mlir_library(TorchFrontendConversion
+  ConvertTorchToCcl.cpp
   ConvertTorchToCustomCall.cpp
   ConvertTorchToStablehloExt.cpp
-  FuseOpOnTorch.cpp
 
   DEPENDS
   TorchFrontendConversionPassIncGen
-  FuseOpOnTorchPatternIncGen
 
   LINK_COMPONENTS
   Core
@@ -19,13 +14,9 @@ add_mlir_library(TorchFrontendConversion
   MLIRPass
   MLIRDialect
   MLIRTransforms
-  MLIRMhloUtils
   ChloOps
-  ChloPasses
   StablehloOps
-  MhloDialect
-  MhloToLinalg
-  MhloTypeConversion
+  MLIRCclDialect
   TorchMLIRConversionUtils
   TorchMLIRTorchDialect
   TorchMLIRTorchPasses
@@ -33,4 +24,3 @@ add_mlir_library(TorchFrontendConversion
   TorchMLIRTorchConversionPasses
   TorchMLIRTorchUtils
 )
-target_include_directories(TorchFrontendConversion PUBLIC ${CMAKE_CURRENT_BINARY_DIR})

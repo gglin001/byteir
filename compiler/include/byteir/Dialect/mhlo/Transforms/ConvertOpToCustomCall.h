@@ -1,4 +1,4 @@
-//===- ConvertRngToCustomCall.h -------------------------------*--- C++ -*-===//
+//===- ConvertOpToCustomCall.h --------------------------------*--- C++ -*-===//
 //
 // Copyright 2022 ByteDance Ltd. and/or its affiliates. All rights reserved.
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,13 +22,15 @@
 #include <memory>
 
 namespace mlir {
-namespace func {
-class FuncOp;
-} // namespace func
+
+class ModuleOp;
 
 void populateRngPatternToCustomCall(RewritePatternSet &patterns);
 
-std::unique_ptr<OperationPass<func::FuncOp>> createConvertOpToCustomCallPass();
+void populateFlashFwdRewritePattern(RewritePatternSet &patterns);
+
+std::unique_ptr<OperationPass<ModuleOp>>
+createConvertOpToCustomCallPass(llvm::StringRef anchor = "");
 
 } // namespace mlir
 

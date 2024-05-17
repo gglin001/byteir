@@ -60,7 +60,8 @@ namespace {
     cb(layer_norm, LayerNorm, CALL_TARGET_NAME_PREFIX)    \
     cb(l2_norm, L2Norm, CALL_TARGET_NAME_PREFIX)          \
     cb(addn, AddN, CALL_TARGET_NAME_PREFIX)               \
-    cb(one_hot, OneHot, CALL_TARGET_NAME_PREFIX)           \
+    cb(one_hot, OneHot, CALL_TARGET_NAME_PREFIX)          \
+    cb(repeat, Repeat, CALL_TARGET_NAME_PREFIX)           \
     cb(DynamicMaskStitch, DynamicMaskStitch, CALL_TF_TARGET_NAME_PREFIX) \
     cb(DynamicPartition, DynamicPartition, CALL_TF_TARGET_NAME_PREFIX)   \
     cb(DynamicStitch, DynamicStitch, CALL_TF_TARGET_NAME_PREFIX)
@@ -173,6 +174,16 @@ Value createLayerNorm(PatternRewriter &rewriter, Location loc, Value input,
   customCallOp->setAttr(getByteIRAttrs(),
                         rewriter.getDictionaryAttr(byteir_attrs));
   return customCallOp.getResults()[0];
+}
+
+Value createLayerNormWithoutBeta(PatternRewriter &rewriter, Location loc,
+                                 Value input, Value gama, ElementsAttr epsilon,
+                                 ElementsAttr axis) {
+  auto gamaShapedType = gama.getType().cast<ShapedType>();
+  auto betaAttr = DenseElementsAttr::get(gamaShapedType, 0.0f);
+  auto betaOp = rewriter.create<TF::ConstOp>(loc, betaAttr);
+  Value beta = betaOp.getOutput();
+  return createLayerNorm(rewriter, loc, input, gama, beta, epsilon, axis);
 }
 
 std::string getBodyName(std::string baseName, SmallVector<Value, 4> inputs,
@@ -322,11 +333,17 @@ struct RewriteMathArg : public OpRewritePattern<TFMathArgOp> {
           "ArgMin/ArgMax's dimension must be one rank.");
     }
     int64_t axis = (*value.getValues<APInt>().begin()).getSExtValue();
+    Value input = mathArgOp.getInput();
+    RankedTensorType inputType = input.getType().cast<RankedTensorType>();
+    auto inputRank = inputType.getRank();
+    if (axis < 0) {
+      axis += inputRank;
+      assert(axis >= 0);
+    }
 
     mhlo::CustomCallOp customCallOp = rewriter.create<mlir::mhlo::CustomCallOp>(
-        mathArgOp->getLoc(), mathArgOp->getResults().getTypes(),
-        mathArgOp.getInput(), WrapName<TFMathArgOp>::name, false,
-        rewriter.getStringAttr(""),
+        mathArgOp->getLoc(), mathArgOp->getResults().getTypes(), input,
+        WrapName<TFMathArgOp>::name, false, rewriter.getStringAttr(""),
         mhlo::CustomCallApiVersion{
             mhlo::CustomCallApiVersion::API_VERSION_ORIGINAL},
         rewriter.getArrayAttr(ArrayRef<Attribute>{}),
@@ -427,6 +444,38 @@ struct RewriteOneHot : public OpRewritePattern<TF::OneHotOp> {
 
     return success();
   }
+};
+
+//===----------------------------------------------------------------------===//
+// Repeat Pattern
+//===----------------------------------------------------------------------===//
+struct RewriteRepeat : public RewritePattern {
+  RewriteRepeat(MLIRContext *context, PatternBenefit benefits = 1)
+      : RewritePattern("tf.Repeat", benefits, context) {}
+  LogicalResult matchAndRewrite(Operation *op,
+                                PatternRewriter &rewriter) const override {
+    // llvm::outs() << op->getName().getStringRef();
+    assert(op->getName().getStringRef() == "tf.Repeat");
+    RankedTensorType outType =
+        op->getResult(0).getType().dyn_cast<RankedTensorType>();
+    if (!outType)
+      return failure();
+    llvm::SmallVector<mlir::Type> outTypes{outType};
+    mhlo::CustomCallOp customCallOp = rewriter.create<mlir::mhlo::CustomCallOp>(
+        op->getLoc(), outTypes, op->getOperands(), getRepeatNameWithPrefix(),
+        false, rewriter.getStringAttr(""),
+        mhlo::CustomCallApiVersion{
+            mhlo::CustomCallApiVersion::API_VERSION_ORIGINAL},
+        rewriter.getArrayAttr(ArrayRef<Attribute>{}),
+        mhlo::CustomCallSchedule{mhlo::CustomCallSchedule::NONE}, nullptr,
+        nullptr, rewriter.getArrayAttr(ArrayRef<Attribute>{}));
+    customCallOp->setAttr(getByteIRAttrs(), getCleanAttr(op));
+    rewriter.replaceOp(op, customCallOp->getResults());
+    return success();
+  }
+
+public:
+  int64_t outBatchSize;
 };
 
 //===----------------------------------------------------------------------===//
@@ -599,7 +648,11 @@ struct RewriteToCustomCallOpsPass
       validCustomCallOpSet[getGeLUName()].emplace_back(
           std::make_unique<RewriteGELUtanhV3>(context));
       validCustomCallOpSet[getGeLUName()].emplace_back(
+          std::make_unique<RewriteGELUtanhV4>(context));
+      validCustomCallOpSet[getGeLUName()].emplace_back(
           std::make_unique<RewriteGELUerf>(context));
+      validCustomCallOpSet[getGeLUName()].emplace_back(
+          std::make_unique<RewriteGELUerfV2>(context));
 
       if (keepBody) {
         validCustomCallOpSet[getLayerNormName()].emplace_back(
@@ -608,6 +661,8 @@ struct RewriteToCustomCallOpsPass
         validCustomCallOpSet[getLayerNormName()].emplace_back(
             std::make_unique<RewriteLayerNorm>(context));
       }
+      validCustomCallOpSet[getLayerNormName()].emplace_back(
+          std::make_unique<RewriteLayerNormWithoutBeta>(context));
       validCustomCallOpSet[getLayerNormName()].emplace_back(
           std::make_unique<RewriteLayerNormSwapAdd>(context));
       validCustomCallOpSet[getLayerNormName()].emplace_back(
@@ -621,7 +676,11 @@ struct RewriteToCustomCallOpsPass
       validCustomCallOpSet[getLayerNormName()].emplace_back(
           std::make_unique<RewriteLayerNormV4>(context));
       validCustomCallOpSet[getLayerNormName()].emplace_back(
+          std::make_unique<RewriteLayerNormV4SwapSquarediff>(context));
+      validCustomCallOpSet[getLayerNormName()].emplace_back(
           std::make_unique<RewriteLayerNormWithCast>(context));
+      validCustomCallOpSet[getLayerNormName()].emplace_back(
+          std::make_unique<RewriteLayerNormWithCastV2>(context));
       validCustomCallOpSet[getLayerNormName()].emplace_back(
           std::make_unique<RewriteLayerNormWithCastDisableMinimizeBroadcast>(
               context));
@@ -632,6 +691,8 @@ struct RewriteToCustomCallOpsPass
           std::make_unique<RewriteL2NormV1SwapMul>(context));
       validCustomCallOpSet[getL2NormName()].emplace_back(
           std::make_unique<RewriteL2NormV2>(context));
+      validCustomCallOpSet[getL2NormName()].emplace_back(
+          std::make_unique<RewriteL2NormV2SwapMul>(context));
       validCustomCallOpSet[getL2NormName()].emplace_back(
           std::make_unique<RewriteL2NormV3>(context));
 
@@ -661,6 +722,8 @@ struct RewriteToCustomCallOpsPass
           std::make_unique<SimpleReplaceDynamicPartition>(context, 1));
       validCustomCallOpSet[getDynamicStitchName()].emplace_back(
           std::make_unique<SimpleReplaceDynamicStitch>(context, 1));
+      validCustomCallOpSet[getRepeatName()].emplace_back(
+          std::make_unique<RewriteRepeat>(context, 1));
 
       RewritePatternSet patterns(context);
       for (auto op : opsSet) {

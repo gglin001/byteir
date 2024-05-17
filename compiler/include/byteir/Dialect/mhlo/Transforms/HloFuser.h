@@ -46,6 +46,10 @@ constexpr StringRef getByteIRMatmulEpilogueFusionAttrName() {
   return "__byteir_matmul_epilogue_fusion__";
 }
 
+constexpr StringRef getByteIRReductionFusionAttrName() {
+  return "__byteir_reduction_fusion__";
+}
+
 constexpr StringRef getByteIRTrivialFusionAttrName() {
   return "__byteir_trivial_fusion__";
 }
@@ -56,9 +60,6 @@ constexpr StringRef getByteIRHloAggressiveFusionAttrName() {
 
 // fuse ReduceWindow with Pad and/or Constant
 void populateFuseReduceWindowPatterns(RewritePatternSet &patterns);
-
-// reshape gather indices to 1D
-void populateReshapeGatherPatterns(RewritePatternSet &patterns);
 
 // fuse ConvForward patterns
 // such as Conv with bias of activation
@@ -78,8 +79,6 @@ void populateTrivialFusionPattern(RewritePatternSet &patterns,
                                   llvm::StringMap<StringRef> &lut_name);
 
 std::unique_ptr<OperationPass<func::FuncOp>> createReduceFusionPass();
-
-std::unique_ptr<OperationPass<func::FuncOp>> createReshapeGatherPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createConvBackwardFusionPass();
 
@@ -101,6 +100,8 @@ std::unique_ptr<OperationPass<func::FuncOp>> createIOConvertFusionPass();
 std::unique_ptr<OperationPass<func::FuncOp>> createTrivialFusionPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createHloAggressiveFusionPass();
+
+std::unique_ptr<OperationPass<func::FuncOp>> createReductionFusionPass();
 
 } // namespace mlir
 

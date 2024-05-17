@@ -24,7 +24,7 @@ llvm::cl::OptionCategory OnnxFrontendOptions("ONNX-Frontend Options", "");
 
 llvm::cl::list<std::string>
     customCallOps("custom-call-ops",
-                  llvm::cl::desc("convert ops to mhlo custom call."),
+                  llvm::cl::desc("convert ops to stablehlo custom call."),
                   llvm::cl::ZeroOrMore, llvm::cl::CommaSeparated,
                   llvm::cl::cat(OnnxFrontendOptions));
 
@@ -33,11 +33,21 @@ llvm::cl::opt<int64_t> batchSize(
     llvm::cl::desc("Specify batch size, default value is -1 (not to specify)."),
     llvm::cl::init(-1), llvm::cl::cat(OnnxFrontendOptions));
 
+llvm::cl::opt<bool> enableUnroll(
+    "enable-unroll",
+    llvm::cl::desc("Enable unroll rather than lowering to stablehlo::WhileOp."),
+    llvm::cl::init(true), llvm::cl::cat(OnnxFrontendOptions));
+
 llvm::cl::opt<bool> forceSetBatchSize(
     "force-set-batch-size",
     llvm::cl::desc("override the first dimension with specified batch size, "
                    "even if it is already set"),
     llvm::cl::init(false), llvm::cl::cat(OnnxFrontendOptions));
+
+llvm::cl::opt<std::string> inputShapes(
+    "input-name-and-shapes",
+    llvm::cl::desc("Specify some input's shapes. Ex. name0,2,3:name1,3,4"),
+    llvm::cl::init(""), llvm::cl::cat(OnnxFrontendOptions));
 
 llvm::cl::opt<int>
     ofRepeatStatic("of-repeat-static",

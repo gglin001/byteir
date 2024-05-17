@@ -7,6 +7,9 @@ import argparse
 def get_config(config: str):
     if config == "":
         return {}
+    if config == "fuse_tf_ops":
+        # FIXME: remove black_list when tf.Conv3D with dilates could run on AMD cpu
+        return {"black_list": ["dilated_conv3d"]}
     if config == "dilated_conv2d":
         # FIXME: remove black_list when support mhlo.convolution dynamic shape
         return {"black_list": ["dilated_conv1"]}
@@ -51,22 +54,28 @@ def get_config(config: str):
                 "log_softmax_case0": 6,
                 "erf_case0": 6,
                 "gelu_erf_case0": 6,
+                "gelu_erf_case1": 6,
                 "gelu_tanh_case0": 6,
                 "gelu_tanh_case1": 2,
                 "gelu_tanh_case2": 6,
+                "gelu_tanh_case3": 2,
                 "layer_norm": 6,
                 "layer_norm_negative_axis": 6,
+                "layer_norm_without_beta": 6,
                 "layer_norm_swap_add": 6,
                 "layer_norm_swap_mul": 6,
                 "layer_norm_swap_squarediff": 6,
                 "layer_norm_V2": 6,
                 "layer_norm_V3_disable_minimize_broadcast": 6,
                 "layer_norm_V4": 2,
+                "layer_norm_V4_swap_squarediff": 2,
                 "layer_norm_with_cast": 2,
+                "layer_norm_with_cast_v2": 2,
                 "layer_norm_with_cast_disable_minimize_broadcast": 2,
                 "l2_norm_V1": 6,
                 "l2_norm_V1_swap_mul": 6,
                 "l2_norm_V2": 3,
+                "l2_norm_V2_swap_mul": 3,
                 "l2_norm_V3": 6,
                 "onehot_case0": 6,
             },

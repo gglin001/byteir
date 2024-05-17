@@ -17,12 +17,12 @@
 
 #include "byteir/Pipelines/BufferizeOpt.h"
 
-#include "byteir/Conversion/HloToLHlo/HloToLHlo.h"
 #include "byteir/Dialect/MemRef/Passes.h"
 #include "byteir/Pipelines/Common/Utils.h"
 #include "byteir/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Transforms/Passes.h"
 #include "transforms/passes.h"
 
@@ -37,6 +37,7 @@ void mlir::createByteIRBufferizeOptPipeline(
         pm.addPass(byteir::createOneShotBufferizePass());
         addCleanUpExtPassPipeline(pm);
 
+        pm.addNestedPass<func::FuncOp>(memref::createFoldMemRefAliasOpsPass());
         // clean-up possible redundant copy from bufferization
         // perform twice, since cse is not greedy-based
         pm.addNestedPass<func::FuncOp>(createRemoveCopyPass());

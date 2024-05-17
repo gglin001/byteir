@@ -18,6 +18,7 @@
 #include "byteir/Dialect/mhlo/Transforms/HloFuser.h"
 
 #include "byteir/Dialect/mhlo/Transforms/GenericFusionCommon.h"
+#include "byteir/Dialect/mhlo/Util/CustomCallUtil.h"
 #include "byteir/Dialect/mhlo/Util/FusionUtil.h"
 #include "byteir/Dialect/mhlo/Util/Util.h"
 #include "byteir/Utils/IRRewrite.h"
@@ -36,13 +37,21 @@ using namespace mlir::mhlo;
 namespace {
 namespace elementwise {
 
+bool isCustomMhloRngOp(Operation *op) {
+  if (auto customOp = llvm::dyn_cast_or_null<mhlo::CustomCallOp>(op)) {
+    return customOp.getCallTargetName() == getRngUniformName();
+  }
+  return false;
+}
+
 // TODO: maybe we should support non-splat constant on device in future
 bool isFusibleCandidate(Operation *op) {
   return isMhlo(op) &&
          (op->hasTrait<::mlir::OpTrait::Elementwise>() ||
           op->hasTrait<hlo::OpTrait::BroadcastingElementwise>() ||
           isSplatMhloConstantLike(op) ||
-          isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp, mhlo::ReshapeOp>(op));
+          isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp, mhlo::ReshapeOp>(op) ||
+          isCustomMhloRngOp(op));
 }
 
 // every candidate can start
@@ -51,7 +60,7 @@ bool isFusibleStart(Operation *op) { return true; }
 bool isFusibleTrigger(Operation *op) {
   if (op->hasTrait<::mlir::OpTrait::Elementwise>() ||
       op->hasTrait<hlo::OpTrait::BroadcastingElementwise>() ||
-      isa<mhlo::ReshapeOp>(op)) {
+      isa<mhlo::ReshapeOp>(op) || isCustomMhloRngOp(op)) {
     return true;
   }
 
@@ -76,19 +85,24 @@ bool isFusibleWith(Operation *target, Operation * /*start*/) {
          target->hasTrait<hlo::OpTrait::BroadcastingElementwise>() ||
          isSplatMhloConstantLike(target) ||
          isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp, mhlo::ReshapeOp>(
-             target);
+             target) ||
+         isCustomMhloRngOp(target);
 }
 
 bool isValidSingleOp(Operation *op) {
   return op->hasTrait<::mlir::OpTrait::Elementwise>() ||
          op->hasTrait<hlo::OpTrait::BroadcastingElementwise>() ||
-         isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp, mhlo::IotaOp>(op);
+         isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp, mhlo::IotaOp>(op) ||
+         isCustomMhloRngOp(op);
 }
+
+bool isValidFusionPattern(const MhloFusionPattern &) { return true; }
 
 static GenericFuserConfig config{
     getByteIRElementwiseFusionAttrName(), elementwise::isFusibleCandidate,
     elementwise::isFusibleStart,          elementwise::isFusibleTrigger,
-    elementwise::isFusibleWith,           elementwise::isValidSingleOp};
+    elementwise::isFusibleWith,           elementwise::isValidSingleOp,
+    elementwise::isValidFusionPattern};
 
 } // namespace elementwise
 
@@ -115,14 +129,96 @@ bool isFusibleWith(Operation * /*target*/, Operation * /*start*/) {
 
 bool isValidSingleOp(Operation *op) { return false; }
 
+bool isValidFusionPattern(const MhloFusionPattern &) { return true; }
+
 static GenericFuserConfig config{getByteIRMatmulEpilogueFusionAttrName(),
                                  matmul_epilogue::isFusibleCandidate,
                                  matmul_epilogue::isFusibleStart,
                                  matmul_epilogue::isFusibleTrigger,
                                  matmul_epilogue::isFusibleWith,
-                                 matmul_epilogue::isValidSingleOp};
+                                 matmul_epilogue::isValidSingleOp,
+                                 matmul_epilogue::isValidFusionPattern};
 
 } // namespace matmul_epilogue
+
+namespace reduction {
+// TODO: maybe we should support non-splat constant on device in future
+bool isFusibleCandidate(Operation *op) {
+  return isMhlo(op) && (op->hasTrait<::mlir::OpTrait::Elementwise>() ||
+                        op->hasTrait<hlo::OpTrait::BroadcastingElementwise>() ||
+                        isSplatMhloConstantLike(op) ||
+                        isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp,
+                            mhlo::ReshapeOp, mhlo::ReduceOp>(op));
+}
+
+// every candidate can start
+bool isFusibleStart(Operation *op) { return true; }
+
+bool isFusibleTrigger(Operation *op) {
+  if (op->hasTrait<::mlir::OpTrait::Elementwise>() ||
+      op->hasTrait<hlo::OpTrait::BroadcastingElementwise>() ||
+      isa<mhlo::ReshapeOp>(op)) {
+    return true;
+  }
+
+  // if broadcast, check whether its operand is only used in broadcast
+  if (isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp>(op)) {
+    auto src = op->getOperand(0);
+    // is foldable we just allow
+    if (isDeepMhloFoldable(src.getDefiningOp())) {
+      return true;
+    }
+    // otherwise, check it is only used in broadcast
+    // return useCount(src) == 1;
+    // LWC FIXME: change back to above after broadcast fusion resolve.
+    return false;
+  }
+
+  if (isa<mhlo::ReduceOp>(op))
+    return true;
+
+  return false;
+}
+
+bool isFusibleWith(Operation *target, Operation * /*start*/) {
+  return (target->hasTrait<::mlir::OpTrait::Elementwise>() ||
+          target->hasTrait<hlo::OpTrait::BroadcastingElementwise>() ||
+          isSplatMhloConstantLike(target) ||
+          isa<mhlo::BroadcastInDimOp, mhlo::BroadcastOp, mhlo::ReshapeOp>(
+              target)) &&
+         target->hasOneUse();
+}
+
+bool isValidSingleOp(Operation *op) { return isa<mhlo::ReduceOp>(op); }
+
+bool isValidFusionPattern(const MhloFusionPattern &pattern) {
+  SmallVector<Value, 4> outputs = getOutputsOfCluster(pattern);
+  if (outputs.size() == 1) {
+    if (auto reduceOp = outputs[0].getDefiningOp<mhlo::ReduceOp>()) {
+      ValueRange inputs = reduceOp.getInputs();
+      auto reduceDims = reduceOp.getDimensionsAttr();
+      for (Value in : inputs) {
+        auto inputShape = in.getType().cast<ShapedType>().getShape();
+        for (auto iter = reduceDims.begin(); iter != reduceDims.end(); iter++) {
+          APInt reDim = *iter;
+          if (inputShape[reDim.getSExtValue()] != 1) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+static GenericFuserConfig config{
+    getByteIRReductionFusionAttrName(), reduction::isFusibleCandidate,
+    reduction::isFusibleStart,          reduction::isFusibleTrigger,
+    reduction::isFusibleWith,           reduction::isValidSingleOp,
+    reduction::isValidFusionPattern};
+
+} // namespace reduction
 
 // a derived fusion pass for elementwise
 struct ElementwiseFusionPass : public GenericFusionPass<ElementwiseFusionPass> {
@@ -177,6 +273,29 @@ struct MatmulEpilogueFusionPass
   ::llvm::StringRef getName() const override { return "MatmulEpilogueFusion"; }
 };
 
+// a derived fusion pass for reduction fusion
+struct ReductionFusionPass : public GenericFusionPass<ReductionFusionPass> {
+
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ReductionFusionPass)
+
+  ReductionFusionPass() : GenericFusionPass(reduction::config, false) {}
+
+  /// Returns the command-line argument attached to this pass.
+  static constexpr ::llvm::StringLiteral getArgumentName() {
+    return ::llvm::StringLiteral("fuse-reduction");
+  }
+  ::llvm::StringRef getArgument() const override { return "fuse-reduction"; }
+
+  ::llvm::StringRef getDescription() const override {
+    return "Fuse reduction with its producer";
+  }
+
+  /// Returns the derived pass name.
+  static constexpr ::llvm::StringLiteral getPassName() {
+    return ::llvm::StringLiteral("ReductionFusion");
+  }
+  ::llvm::StringRef getName() const override { return "ReductionFusion"; }
+};
 } // namespace
 
 std::unique_ptr<OperationPass<func::FuncOp>>
@@ -187,4 +306,8 @@ mlir::createElementFusionPass(bool clusterSingleElemwiseOp) {
 std::unique_ptr<OperationPass<func::FuncOp>>
 mlir::createMatmulEpilogueFusionPass() {
   return std::make_unique<MatmulEpilogueFusionPass>();
+}
+
+std::unique_ptr<OperationPass<func::FuncOp>> mlir::createReductionFusionPass() {
+  return std::make_unique<ReductionFusionPass>();
 }

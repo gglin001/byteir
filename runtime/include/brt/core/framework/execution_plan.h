@@ -21,6 +21,7 @@
 #include "brt/core/context/execution_context.h"
 #include "brt/core/context/execution_frame.h"
 #include "brt/core/framework/allocator.h"
+#include "brt/core/framework/device_api.h"
 #include "brt/core/framework/dtype.h"
 #include "brt/core/ir/graph_info.h"
 #include "brt/core/ir/ir.h"
@@ -51,11 +52,13 @@ public:
   virtual common::Status ProloguePerSession(
       const std::unordered_map<std::string, std::unique_ptr<IAllocator>>
           &allocators,
-      const std::vector<std::unique_ptr<ExecutionProvider>> &providers) = 0;
+      const std::vector<std::unique_ptr<ExecutionProvider>> &providers,
+      const Device dev, const DeviceAPI *device_api) = 0;
 
   virtual common::Status EpiloguePerSession() = 0;
 
-  virtual void CreateWorkQueue(std::unique_ptr<WorkQueue> *wq) = 0;
+  virtual void CreateWorkQueue(std::unique_ptr<WorkQueue> *wq,
+                               int rank = 0) = 0;
 
   virtual void CreateExecutinFrame(std::unique_ptr<ExecutionFrame> *frame) = 0;
 
@@ -109,12 +112,12 @@ public:
   common::Status ProloguePerSession(
       const std::unordered_map<std::string, std::unique_ptr<IAllocator>>
           &allocators,
-      const std::vector<std::unique_ptr<ExecutionProvider>> &providers)
-      override;
+      const std::vector<std::unique_ptr<ExecutionProvider>> &providers,
+      const Device dev, const DeviceAPI *device_api) override;
 
   common::Status EpiloguePerSession() override;
 
-  void CreateWorkQueue(std::unique_ptr<WorkQueue> *wq) override;
+  void CreateWorkQueue(std::unique_ptr<WorkQueue> *wq, int rank = 0) override;
 
   void CreateExecutinFrame(std::unique_ptr<ExecutionFrame> *frame) override;
 

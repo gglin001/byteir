@@ -145,7 +145,13 @@ T OpAccessor::GetAttrAsSplatValue(const std::string &name) const {
     if (auto attr =
             info_.GetOperation()->getAttrOfType<DenseIntElementsAttr>(name)) {
       if (attr.isSplat()) {
-        return attr.getSplatValue<IntegerAttr>().getInt();
+        mlir::IntegerAttr splatValue = attr.getSplatValue<IntegerAttr>();
+        mlir::Type type = splatValue.getType();
+        if (type.getIntOrFloatBitWidth() == 1 || type.isUnsignedInteger()) {
+          return splatValue.getValue().getZExtValue();
+        } else {
+          return splatValue.getValue().getSExtValue();
+        }
       }
     }
   } else if constexpr (std::is_floating_point<T>::value) {
@@ -169,6 +175,63 @@ T OpAccessor::GetAttrAsSplatValue(const std::string &name) const {
     static_assert(!std::is_same_v<T, T>, "unsupported type of splat value");
   }
   BRT_THROW("Attribute " + name + " is not set");
+}
+
+// GetDenseAttrAsVector will iterate every elements in dense attibutes.
+// If you want to avoid iterating, consider use getRawData() but special handle
+// for i1 ???
+template <typename T>
+std::vector<T> OpAccessor::GetAttrAsVector(const std::string &name) const {
+  std::vector<T> results;
+  if (auto attr =
+          info_.GetOperation()->getAttrOfType<DenseIntElementsAttr>(name)) {
+    results.reserve(attr.size());
+    for (APInt &&i : attr) {
+      results.push_back(static_cast<T>(i.getSExtValue()));
+    }
+    return results;
+  } else if (auto attr =
+                 info_.GetOperation()->getAttrOfType<DenseFPElementsAttr>(
+                     name)) {
+    results.reserve(attr.size());
+    for (APFloat &&i : attr) {
+      results.push_back(static_cast<T>(i.convertToDouble()));
+    }
+    return results;
+  }
+  BRT_THROW("Attribute " + name + " is not supported to get as vector");
+}
+
+void *OpAccessor::GetAttrAsVoidPtr(const std::string &name) const {
+  if (auto attr = info_.GetOperation()->getAttrOfType<ArrayAttr>(name)) {
+    size_t totalSize = 0;
+    for (Attribute elementAttr : attr) {
+      if (auto floatAttr = dyn_cast<FloatAttr>(elementAttr)) {
+        totalSize += sizeof(float);
+      } else if (auto intAttr = dyn_cast<IntegerAttr>(elementAttr)) {
+        totalSize += sizeof(int64_t);
+      } else {
+        // TODO: support string
+        BRT_THROW("Not all elements can be converted to void * for attribute" +
+                  name);
+      }
+    }
+    void *result = malloc(totalSize);
+    int ptr = 0;
+    for (Attribute elementAttr : attr) {
+      if (auto floatAttr = dyn_cast<FloatAttr>(elementAttr)) {
+        float val = floatAttr.getValueAsDouble();
+        std::memcpy(static_cast<char *>(result) + ptr, &val, sizeof(float));
+        ptr += sizeof(float);
+      } else if (auto intAttr = dyn_cast<IntegerAttr>(elementAttr)) {
+        int64_t val = intAttr.getInt();
+        std::memcpy(static_cast<char *>(result) + ptr, &val, sizeof(int64_t));
+        ptr += sizeof(int64_t);
+      }
+    }
+    return result;
+  }
+  BRT_THROW("Attribute " + name + " is not supported to get as void *");
 }
 
 std::string OpAccessor::GetUID() const {
@@ -202,14 +265,22 @@ common::Status OpAccessor::SetResultScalar(size_t result_idx, const T &scalar) {
 #define INST_ATTR_METH(T)                                                      \
   template bool OpAccessor::HasAttrOfSplatValue<T>(const std::string &) const; \
   template T OpAccessor::GetAttrAsSplatValue<T>(const std::string &) const;
-INST_ATTR_METH(float)
-INST_ATTR_METH(int32_t)
 INST_ATTR_METH(int64_t)
-INST_ATTR_METH(uint8_t)
-INST_ATTR_METH(uint32_t)
 INST_ATTR_METH(double)
 INST_ATTR_METH(StringView)
 #undef INST_ATTR_METH
+
+#define INST_DENSE_ATTR_METH(T)                                                \
+  template std::vector<T> OpAccessor::GetAttrAsVector<T>(const std::string &)  \
+      const;
+INST_DENSE_ATTR_METH(float)
+INST_DENSE_ATTR_METH(int32_t)
+INST_DENSE_ATTR_METH(int64_t)
+INST_DENSE_ATTR_METH(uint8_t)
+INST_DENSE_ATTR_METH(uint32_t)
+INST_DENSE_ATTR_METH(double)
+INST_DENSE_ATTR_METH(half_float::half)
+#undef INST_DENSE_ATTR_METH
 
 #define INST_SCALAR_METH(T)                                                    \
   template T OpAccessor::GetArgScalar<T>(size_t);                              \

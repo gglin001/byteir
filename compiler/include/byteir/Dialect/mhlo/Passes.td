@@ -68,12 +68,17 @@ def ConvForwardFusion : Pass<"fuse-conv-forward", "mlir::func::FuncOp"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Convert Rng To CustomCall
+// Convert Op To CustomCall
 //===----------------------------------------------------------------------===//
 
-def ConvertOpToCustomCall : Pass<"convert-op-to-customcall", "mlir::func::FuncOp"> {
+def ConvertOpToCustomCall : Pass<"convert-op-to-customcall", "ModuleOp"> {
   let summary = "Convert op to mhlo.custom_call";
   let constructor = "mlir::createConvertOpToCustomCallPass()";
+  let options = [
+    Option<"anchorTag", "anchor-tag", "std::string",
+            /*default=*/"",
+            "Optional unitAttr anchored tag to apply this pass">
+  ];
 }
 
 //===----------------------------------------------------------------------===//
@@ -167,6 +172,16 @@ def FusionOutlining : Pass<"fusion-outlining", "ModuleOp"> {
 def HloFolder : Pass<"hlo-fold", "mlir::func::FuncOp"> {
   let summary = "Fold mhlo ops";
   let constructor = "mlir::createHloFolderPass()";
+}
+
+//===----------------------------------------------------------------------===//
+// HloSimplify
+//===----------------------------------------------------------------------===//
+
+// TODO(liuyuanqiang): support disable patterns
+def HloSimplify : Pass<"hlo-simplify", "func::FuncOp"> {
+  let summary = "Graph simplify for hlo ops";
+  let constructor = "mlir::createHloSimplifyPass()";
 }
 
 //===----------------------------------------------------------------------===//
@@ -280,15 +295,6 @@ def LayoutTransformation : Pass<"transform-layout", "mlir::func::FuncOp"> {
 def ReduceFusion : Pass<"fuse-reduce", "mlir::func::FuncOp"> {
   let summary = "Fuse reduce and reduce-window ops";
   let constructor = "mlir::createReduceFusionPass()";
-}
-
-//===----------------------------------------------------------------------===//
-// ReshapeGather
-//===----------------------------------------------------------------------===//
-
-def ReshapeGather : Pass<"reshape-gather", "mlir::func::FuncOp"> {
-  let summary = "Reshape gather index to be 1D";
-  let constructor = "mlir::createReshapeGatherPass()";
 }
 
 //===----------------------------------------------------------------------===//

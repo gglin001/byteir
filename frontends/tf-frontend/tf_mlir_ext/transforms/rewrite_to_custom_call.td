@@ -68,6 +68,41 @@ def RewriteLayerNorm : Pat<
    (SameTwoValuesOrAttrs $mean_input, $mean_input_1),
    (OneRank $gama_attr), (OneRank $beta_attr)]>;
 
+def RewriteLayerNormWithoutBeta : Pat<
+  (TF_SubOp
+    (TF_MulOp
+      $input,
+      (TF_MulOp:$mul_after_rsqrt
+        (TF_RsqrtOp
+          (TF_AddV2Op
+            (TF_MeanOp
+              (TF_SquaredDifferenceOp
+                $input,
+                (TF_MeanOp:$mean_input
+                  $input,
+                  (TF_ConstOp:$axis $axis_attr),
+                  $keep_dims_0
+                )
+              ),
+              $axis_1,
+              $keep_dims_1
+            ),
+            (TF_ConstOp $epsilon_attr)
+          )
+        ),
+        (TF_ConstOp:$gama $gama_attr)
+      )
+    ),
+    (TF_MulOp $mul_after_rsqrt_1, $mean_input_1)
+  ),
+  (NativeCodeCall<"createLayerNormWithoutBeta($_builder, $_loc, $0, $1, $2, $3)"> $input, $gama, $epsilon_attr, $axis_attr),
+  [(OneSize $epsilon_attr), (OneSize $axis_attr),
+   (TrueBoolAttr $keep_dims_0), (TrueBoolAttr $keep_dims_1),
+   (SameTwoValuesOrAttrs $axis, $axis_1),
+   (SameTwoValuesOrAttrs $mul_after_rsqrt, $mul_after_rsqrt_1),
+   (SameTwoValuesOrAttrs $mean_input, $mean_input_1),
+   (OneRank $gama_attr)]>;
+
 def RewriteLayerNormWithBody : Pat<
   (TF_AddV2Op:$add_outer
     (TF_MulOp:$mul_input
@@ -334,6 +369,43 @@ def RewriteLayerNormV4 : Pat<
    (SameTwoValuesOrAttrs $mean_input, $mean_input_1),
    (OneRank $gama_attr), (OneRank $beta_attr)]>;
 
+def RewriteLayerNormV4SwapSquarediff : Pat<
+  (TF_AddV2Op
+    (TF_MulOp
+      (TF_MulOp
+        (TF_RsqrtOp
+          (TF_AddV2Op
+            (TF_MeanOp
+              (TF_SquaredDifferenceOp
+                $mean_input_1,
+                $input
+              ),
+              $axis_1,
+              $keep_dims_1
+            ),
+            (TF_ConstOp $epsilon_attr)
+          )
+        ),
+        (TF_SubOp
+          $input,
+          (TF_MeanOp:$mean_input
+            $input,
+            (TF_ConstOp:$axis $axis_attr),
+            $keep_dims_0
+          )
+        )
+      ),
+      (TF_ConstOp:$gama $gama_attr)
+    ),
+    (TF_ConstOp:$beta $beta_attr)
+  ),
+  (NativeCodeCall<"createLayerNorm($_builder, $_loc, $0, $1, $2, $3, $4)"> $input, $gama, $beta, $epsilon_attr, $axis_attr),
+  [(OneSize $epsilon_attr), (OneSize $axis_attr),
+   (TrueBoolAttr $keep_dims_0), (TrueBoolAttr $keep_dims_1),
+   (SameTwoValuesOrAttrs $axis, $axis_1),
+   (SameTwoValuesOrAttrs $mean_input, $mean_input_1),
+   (OneRank $gama_attr), (OneRank $beta_attr)]>;
+
 def RewriteLayerNormWithCast : Pat<
   (TF_AddV2Op
     (TF_MulOp
@@ -376,6 +448,54 @@ def RewriteLayerNormWithCast : Pat<
    (SameTwoValuesOrAttrs $axis, $axis_1),
    (SameTwoValuesOrAttrs $input_cast, $input_cast_1),
    (SameTwoValuesOrAttrs $input_cast_mean, $input_cast_mean_1),
+   (OneRank $gama_attr), (OneRank $beta_attr)]>;
+
+def RewriteLayerNormWithCastV2 : Pat<
+  (TF_AddV2Op
+    (TF_MulOp
+      $input,
+      (TF_MulOp:$factor
+        (TF_RsqrtOp
+          (TF_AddV2Op
+            (TF_CastOp
+              (TF_MeanOp
+                (TF_SquaredDifferenceOp
+                  $input_cast_1,
+                  (TF_MeanOp:$input_cast_mean
+                    (TF_CastOp:$input_cast $input, $_),
+                    (TF_ConstOp:$axis $axis_attr),
+                    $keep_dims_0
+                  )
+                ),
+                $axis_1,
+                $keep_dims_1
+              ),
+              $_
+            ),
+            (TF_ConstOp $epsilon_attr)
+          )
+        ),
+        (TF_ConstOp:$gama $gama_attr)
+      )
+    ),
+    (TF_SubOp
+      (TF_ConstOp:$beta $beta_attr),
+      (TF_MulOp
+        $factor_1,
+        (TF_CastOp
+          $input_cast_mean_1,
+          $_
+        )
+      )
+    )
+  ),
+  (NativeCodeCall<"createLayerNorm($_builder, $_loc, $0, $1, $2, $3, $4)"> $input, $gama, $beta, $epsilon_attr, $axis_attr),
+  [(OneSize $epsilon_attr), (OneSize $axis_attr),
+   (TrueBoolAttr $keep_dims_0), (TrueBoolAttr $keep_dims_1),
+   (SameTwoValuesOrAttrs $axis, $axis_1),
+   (SameTwoValuesOrAttrs $input_cast, $input_cast_1),
+   (SameTwoValuesOrAttrs $input_cast_mean, $input_cast_mean_1),
+   (SameTwoValuesOrAttrs $factor, $factor_1),
    (OneRank $gama_attr), (OneRank $beta_attr)]>;
 
 def RewriteLayerNormWithCastDisableMinimizeBroadcast : Pat<
@@ -485,6 +605,24 @@ def RewriteL2NormV2 : Pat<
   (NativeCodeCall<"createL2NormV2($_builder, $_loc, $0, $1)"> $input, $axis_attr),
   [(OneSize $axis_attr), (TrueBoolAttr $keep_dims)]>;
 
+def RewriteL2NormV2SwapMul : Pat<
+  (TF_MulOp
+    $input,
+    (TF_RsqrtOp
+      (TF_ReluOp
+        (TF_SumOp
+          (TF_SquareOp
+            $input
+          ),
+          (TF_ConstOp:$axis $axis_attr),
+          $keep_dims
+        )
+      )
+    )
+  ),
+  (NativeCodeCall<"createL2NormV2($_builder, $_loc, $0, $1)"> $input, $axis_attr),
+  [(OneSize $axis_attr), (TrueBoolAttr $keep_dims)]>;
+
 // note: x^2 guarantee >= 0, so set epsilon to 0.0
 def RewriteL2NormV3 : Pat<
   (TF_MulOp
@@ -525,6 +663,25 @@ def RewriteGELUerf : Pat<
     (TF_MulOp
       (TF_ConstOp $cst1),
       $input
+    )
+  ),
+  (NativeCodeCall<"createGELU($_builder, $_loc, $0, \"erf\")"> $input),
+  [(GeluValue0 $cst1), (GeluValue1 $cst0), (GeluValue5 $cst)]>;
+
+def RewriteGELUerfV2 : Pat<
+  (TF_MulOp
+    $input,
+    (TF_MulOp
+      (TF_AddV2Op
+        (TF_ErfOp
+          (TF_MulOp
+            $input,
+            (TF_ConstOp $cst)
+          )
+        ),
+        (TF_ConstOp $cst0)
+      ),
+      (TF_ConstOp $cst1)
     )
   ),
   (NativeCodeCall<"createGELU($_builder, $_loc, $0, \"erf\")"> $input),
@@ -615,6 +772,35 @@ def RewriteGELUtanhV3 : Pat<
   ),
   (NativeCodeCall<"createGELU($_builder, $_loc, $0, \"tanh\")"> $input),
   [(GeluValue0 $cst0), (GeluValue1 $cst1), (GeluValue2 $cst2), (GeluValue4 $cst3), (GeluValue3 $cst4)]>;
+
+
+def RewriteGELUtanhV4 : Pat<
+  (TF_MulOp
+    (TF_AddV2Op
+      (TF_TanhOp
+        (TF_MulOp
+          (TF_AddV2Op
+            $input,
+            (TF_MulOp
+              (TF_PowOp
+                $input,
+                (TF_ConstOp $cst0)
+              ),
+              (TF_ConstOp $cst)
+            )
+          ),
+          (TF_ConstOp $cst3)
+        )
+      ),
+      (TF_ConstOp $cst1)
+    ),
+    (TF_MulOp
+      $input,
+      (TF_ConstOp $cst2)
+    )
+  ),
+  (NativeCodeCall<"createGELU($_builder, $_loc, $0, \"tanh\")"> $input),
+  [(GeluValue4 $cst), (GeluValue3 $cst0), (GeluValue1 $cst1), (GeluValue0 $cst2), (GeluValue2 $cst3)]>;
 
 
 #endif // REWRITE_TO_CUSTOM_CALL_PATTERN

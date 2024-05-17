@@ -27,6 +27,7 @@ include "byteir/Dialect/Byre/ByreBase.td"
 include "mlir/Dialect/LLVMIR/LLVMOpBase.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/DataLayoutInterfaces.td"
+include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "mlir/Interfaces/CopyOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ViewLikeInterface.td"
@@ -38,6 +39,45 @@ include "mlir/Interfaces/ViewLikeInterface.td"
 // Base class
 class Byre_Op<string mnemonic, list<Trait> traits = []> :
     Op<Byre_Dialect, mnemonic, traits>;
+
+def Byre_ComputeOnTensorOp : Byre_Op<"compute_on_tensor",
+    [HasParent<"func::FuncOp">, ByreInterface, AttrSizedOperandSegments,
+    DestinationStyleOpInterface]> {
+  let summary = "compute operation with DestinationStyle in tensor level";
+  let description = [{
+    Example:
+    ```mlir
+    %0 = tensor.empty() : tensor<2x4xf32>
+    %1 = byre.compute_on_tensor @MatmulOp
+    {lhs_contracting_dimension = 1 : i64, rhs_contracting_dimension = 0 : i64}
+    ins(%arg0, %arg1 : tensor<2x10xf32>, tensor<10x4xf32>)
+    outs(%0 : tensor<2x4xf32>) : tensor<2x4xf32>
+    ```
+  }];
+
+  let arguments = (ins
+    FlatSymbolRefAttr:$callee,
+    Variadic<AnyRankedTensor>:$inputs,
+    Variadic<AnyRankedTensor>:$outputs
+  );
+
+  let results = (outs
+    Variadic<AnyRankedTensor>:$results
+  );
+
+  let extraClassDeclaration = [{
+    MutableOperandRange getDpsInitsMutable() { return getOutputsMutable(); }
+  }];
+
+  let assemblyFormat = [{
+    $callee
+    attr-dict
+    (`ins` `(` $inputs^ `:` type($inputs) `)`)?
+    (`outs` `(` $outputs^ `:` type($outputs) `)`)?
+    (`:` type($results)^)?
+  }];
+
+}
 
 def Byre_ComputeOp : Byre_Op<"compute",
     [HasParent<"func::FuncOp">, ByreInterface, MemRefsNormalizable,
@@ -52,7 +92,7 @@ def Byre_ComputeOp : Byre_Op<"compute",
 
   let arguments = (ins
     FlatSymbolRefAttr:$callee,
-    Variadic<AnyType>:$operands,
+    Variadic<AnyTypeOf<[AnyMemRef, AnyInteger, Index]>>:$operands,
     OptionalAttr<ArrayAttr>:$memory_effects
   );
 
@@ -175,6 +215,55 @@ def Byre_AliasOp
   );
 
   let hasCanonicalizer = 1;
+  let hasVerifier = 1;
+}
+
+def Byre_CustomOp : Byre_Op<"custom",
+    [HasParent<"func::FuncOp">,
+    DeclareOpInterfaceMethods<ByreInterface, ["getCalleeName"]>]> {
+  let summary = "compute custom operation passed by library path and api name. ";
+  let description = [{ 
+    Example:
+    ```mlir
+    %2 = byre.custom(%0, %1) { lib_path = "xxx.so", api_name = "add", version = "1.0.0", extra_args = [0 : i64, 1 : i64, 2.0 : f32] } : (f32, f32) -> f32
+    ```
+    During execution, "xxx.so" will be loaded, and "add" function will be called.
+  }];
+
+  let arguments = (ins
+    StrAttr:$lib_path,
+    StrAttr:$api_name,
+    StrAttr:$version,
+    Variadic<AnyType>:$operands,
+    ArrayAttr:$extra_args,
+    OptionalAttr<ArrayAttr>:$memory_effects
+  );
+
+  let results = (outs
+    Variadic<AnyType>:$results
+  );
+
+  let builders = [
+     OpBuilder<(ins "StringRef":$lib_path,
+                    "StringRef":$api_name,
+                    "StringRef":$version,
+                    "ValueRange":$inputs,
+                    "ValueRange":$outputs,
+                    "ArrayAttr":$extra_args)>
+  ];
+
+  let extraClassDeclaration = [{
+    FunctionType getType();
+	
+    /// Get the argument operands to the called function.
+    operand_range getArgOperands() {
+      return {arg_operand_begin(), arg_operand_end()};
+    }
+
+    operand_iterator arg_operand_begin() { return operand_begin(); }
+    operand_iterator arg_operand_end() { return operand_end(); }
+  }];
+
   let hasVerifier = 1;
 }
 

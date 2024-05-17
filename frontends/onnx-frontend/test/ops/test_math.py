@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 from test.base import TestBase
-from test.ops.utils import build_onnx
+from test.ops.utils import build_onnx, build_reduce_sum_axis_one
 import onnx
 
 
@@ -91,12 +91,37 @@ class TestOpsMath(TestBase):
                  model_onnx_pb=proto,
                  input_shape_dtype=input_shape_dtype)
 
+    def test_elu(self):
+        input_shape_dtype = [
+            ["X", (20, 40), "float32"],
+        ]
+        output_shape_dtype = [
+            ["Y", (20, 40), "float32"],
+        ]
+        proto = build_onnx("Elu", input_shape_dtype, output_shape_dtype, alpha=1.0)
+        self.run(model_filename="elu.onnx",
+                 model_onnx_pb=proto,
+                 input_shape_dtype=input_shape_dtype)
+
+
+    def test_prelu(self):
+        input_shape_dtype = [
+            ["x", (3, 4, 5), "float32"],
+            ["slope", (5, ), "float32"],
+        ]
+        output_shape_dtype = [
+            ["y", (3, 4, 5), "float32"],
+        ]
+        proto = build_onnx("PRelu", input_shape_dtype, output_shape_dtype)
+        self.run(model_filename="prelu.onnx",
+                 model_onnx_pb=proto,
+                 input_shape_dtype=input_shape_dtype)
+
     def test_mat_mul(self):
         input_shape_dtype = [
             ["X", (3, 2, 5, 4), "float32"],
             ["Y", (3, 2, 4, 3), "float32"]
         ]
-        
         output_shape_dtype = [
             ["Z", (3, 2, 5, 3), "float32"],
         ]
@@ -144,17 +169,14 @@ class TestOpsMath(TestBase):
     def test_reduce_sum(self):
         input_shape_dtype = [
             ["X", (3, 2, 2), "float32"],
-            ["axis", (1,), "int64"],
         ]
         output_shape_dtype = [
             ["Y", (3, 1, 2), "float32"],
         ]
-        proto = build_onnx("ReduceSum", input_shape_dtype, output_shape_dtype)
-
+        proto = build_reduce_sum_axis_one(input_shape_dtype, output_shape_dtype)
         np.random.seed(0)
         input_data = {
             "X": np.random.rand(3, 2, 2).astype(np.float32),
-            "axis": np.array([1], dtype=np.int64),
         }
         self.run(model_filename="reduce_sum.onnx", model_onnx_pb=proto, input_data=input_data)
 
@@ -179,6 +201,18 @@ class TestOpsMath(TestBase):
         ]
         proto = build_onnx("GlobalAveragePool", input_shape_dtype, output_shape_dtype)
         self.run(model_filename="globalavg.onnx",
+                 model_onnx_pb=proto,
+                 input_shape_dtype=input_shape_dtype)
+
+    def test_hard_sigmoid(self):
+        input_shape_dtype = [
+            ["X", (20, 40), "float32"],
+        ]
+        output_shape_dtype = [
+            ["Y", (20, 40), "float32"],
+        ]
+        proto = build_onnx("HardSigmoid", input_shape_dtype, output_shape_dtype, alpha=0.5, beta=0.5)
+        self.run(model_filename="hardsigmoid.onnx",
                  model_onnx_pb=proto,
                  input_shape_dtype=input_shape_dtype)
 
@@ -237,8 +271,35 @@ class TestOpsMath(TestBase):
                  model_onnx_pb=proto,
                  input_shape_dtype=input_shape_dtype)
 
+    def test_min(self):
+        input_shape_dtype = [
+            ["X", (3, 2), "float32"],
+            ["Y", (3, 2), "float32"],
+        ]
+        output_shape_dtype = [
+            ["Z", (3, 2), "float32"],
+        ]
+        proto = build_onnx("Min", input_shape_dtype, output_shape_dtype)
+        self.run(model_filename="min.onnx",
+                 model_onnx_pb=proto,
+                 input_shape_dtype=input_shape_dtype)
+
     def test_gelu(self):
         input_shape_dtype = [
             ["input_0", (1, 5, 5, 3), "float32"],
         ]
         self.run(model_filename="gelu.onnx", input_shape_dtype=input_shape_dtype)
+
+    def test_where(self):
+        input_shape_dtype = [
+            ["pred", (3, 2), "bool"],
+            ["X", (3, 2), "float32"],
+            ["Y", (3, 2), "float32"],
+        ]
+        output_shape_dtype = [
+            ["Z", (3, 2), "float32"],
+        ]
+        proto = build_onnx("Where", input_shape_dtype, output_shape_dtype)
+        self.run(model_filename="where.onnx",
+                 model_onnx_pb=proto,
+                 input_shape_dtype=input_shape_dtype)

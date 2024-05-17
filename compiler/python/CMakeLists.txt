@@ -16,10 +16,12 @@ declare_mlir_python_sources(ByteIRPythonSources.Common
   ADD_TO_PARENT ByteIRPythonSources
   SOURCES
     __init__.py
-    _byteir_registry.py
+    _backend_registry.py
     utils.py
     compile.py
     tools/compiler.py
+    tools/cat_execute.py
+    tools/cat_numerical_test.py
 
     # involve byteir init hooks
     _mlir_libs/_site_initialize_0.py
@@ -70,6 +72,8 @@ add_mlir_python_common_capi_library(ByteIRCAPIAggregation
     MLIRPythonExtension.RegisterEverything
     MLIRHLOPythonSources
     MLIRHLOPythonExtensions
+    StablehloPythonSources
+    StablehloPythonExtensions
     ByteIRPythonSources
     ByteIRPythonExtensions
 )
@@ -90,6 +94,8 @@ add_mlir_python_modules(ByteIRPythonModules
     MLIRPythonExtension.RegisterEverything
     MLIRHLOPythonSources
     MLIRHLOPythonExtensions
+    StablehloPythonSources
+    StablehloPythonExtensions
     ByteIRPythonSources
     ByteIRPythonExtensions
   COMMON_CAPI_LINK_LIBS

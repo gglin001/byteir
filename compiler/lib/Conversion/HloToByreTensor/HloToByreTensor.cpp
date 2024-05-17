@@ -16,9 +16,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "byteir/Conversion/HloToByreTensor/HloToByreTensor.h"
+#include "byteir/Conversion/FuncToByre/FuncToByre.h"
 #include "byteir/Dialect/Ace/AceDialect.h"
 #include "byteir/Dialect/Byre/ByreDialect.h"
 #include "byteir/Dialect/Byre/Common.h"
+#include "byteir/Dialect/mhlo/Transforms/HloFuser.h"
 #include "byteir/Dialect/mhlo/Util/CustomCallUtil.h"
 #include "byteir/Dialect/mhlo/Util/Util.h"
 #include "byteir/Utils/Utils.h"
@@ -39,19 +41,21 @@ using namespace llvm;
 
 namespace {
 
-byre::ComputeOp replaceMhloOpWithByreComputeOp(RewriterBase &rewriter,
-                                               Operation *op,
-                                               StringRef calleeName,
-                                               ValueRange newOperands,
-                                               bool appendArgTypes) {
+FailureOr<byre::ComputeOnTensorOp> replaceMhloOpWithByreComputeOnTensorOp(
+    RewriterBase &rewriter, Operation *op, StringRef calleeName,
+    ValueRange newOperands, bool appendArgTypes) {
   auto key =
       byre::getByreKey(calleeName,
                        llvm::to_vector(llvm::map_range(
                            newOperands, [](Value v) { return v.getType(); })),
                        op->getResultTypes(), appendArgTypes);
-  return rewriter.replaceOpWithNewOp<byre::ComputeOp>(
-      op, op->getResultTypes(), key, newOperands,
-      /*memEffects*/ ArrayAttr{});
+  auto emptyTensors = createEmptyTensorForOpResult(rewriter, op);
+  if (failed(emptyTensors)) {
+    return failure();
+  }
+
+  return rewriter.replaceOpWithNewOp<byre::ComputeOnTensorOp>(
+      op, op->getResultTypes(), key, newOperands, *emptyTensors);
 }
 
 template <typename SrcOpTy, bool keepAttrs = false>
@@ -72,13 +76,16 @@ public:
       return failure();
     }
 
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, iter->second, adaptor.getOperands(), appendArgTypes);
-
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
     if constexpr (keepAttrs) {
-      addAttrs(computeOp.getOperation(), op->getAttrs());
+      addAttrs(computeOnTensorOp.getOperation(), op->getAttrs());
     } else {
-      static_cast<void>(computeOp);
+      static_cast<void>(computeOnTensorOp);
     }
 
     return success();
@@ -100,15 +107,18 @@ public:
   matchAndRewrite(CustomCallOp op, typename CustomCallOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
 
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, op.getCallTargetName(), adaptor.getOperands(), false);
-
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
     auto dictAttr =
         op->template getAttrOfType<DictionaryAttr>(getCustomCallAttrName());
     if (dictAttr) {
-      NamedAttrList originAttrs = computeOp->getAttrs();
+      NamedAttrList originAttrs = computeOnTensorOp->getAttrs();
       originAttrs.append(dictAttr);
-      computeOp->setAttrs(originAttrs);
+      computeOnTensorOp->setAttrs(originAttrs);
     }
 
     return success();
@@ -129,16 +139,16 @@ public:
   }
 };
 
-class ConvertReshapeOp : public OpConversionPattern<mhlo::ReshapeOp> {
+template <typename OP> class ConvertReshapeOp : public OpConversionPattern<OP> {
 public:
-  using OpConversionPattern::OpConversionPattern;
+  using OpConversionPattern<OP>::OpConversionPattern;
 
   LogicalResult
-  matchAndRewrite(mhlo::ReshapeOp op, mhlo::ReshapeOp::Adaptor adaptor,
+  matchAndRewrite(OP op, typename OP::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
     auto operand = adaptor.getOperand();
-    auto operandType = operand.getType().cast<ShapedType>();
-    auto resultType = op.getType().cast<ShapedType>();
+    auto operandType = operand.getType().template cast<ShapedType>();
+    auto resultType = op.getType().template cast<ShapedType>();
 
     if (!operandType.hasStaticShape() || !resultType.hasStaticShape())
       return failure();
@@ -222,9 +232,9 @@ public:
   matchAndRewrite(mhlo::ConcatenateOp concatOp,
                   typename mhlo::ConcatenateOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const final {
+    // All input tensors must have the same shape, except in the cat
+    // dimension. And all tensor must have static size in the cat dimension.
     auto resultType = concatOp.getType();
-    if (!resultType.hasStaticShape())
-      return failure();
 
     uint64_t axis = concatOp.getDimension();
     if (llvm::any_of(adaptor.getOperands(), [&](auto &&value) {
@@ -232,24 +242,36 @@ public:
         }))
       return failure();
 
-    auto zeroAttr = rewriter.getI64IntegerAttr(0);
-    auto oneAttr = rewriter.getI64IntegerAttr(1);
-    SmallVector<OpFoldResult> offsets, sizes, strides;
+    auto firstOperand = adaptor.getOperands()[0];
+    SmallVector<Value> sizes;
+    SmallVector<int64_t> static_offsets(resultType.getRank(), 0), static_sizes,
+        static_strides(resultType.getRank(), 1);
     for (int64_t i = 0; i < resultType.getRank(); ++i) {
-      offsets.push_back(zeroAttr);
-      sizes.push_back(rewriter.getI64IntegerAttr(resultType.getDimSize(i)));
-      strides.push_back(oneAttr);
+      if (resultType.isDynamicDim(i)) {
+        static_sizes.push_back(ShapedType::kDynamic);
+        sizes.push_back(rewriter.create<tensor::DimOp>(concatOp->getLoc(),
+                                                       firstOperand, i));
+      } else {
+        static_sizes.push_back(resultType.getDimSize(i));
+      }
     }
 
+    SmallVector<Value> dynDims;
+    for (int64_t i = 0; i < resultType.getRank(); ++i)
+      if (resultType.isDynamicDim(i)) {
+        dynDims.push_back(rewriter.create<tensor::DimOp>(concatOp->getLoc(),
+                                                         firstOperand, i));
+      }
     Value value = rewriter.create<tensor::EmptyOp>(concatOp->getLoc(),
-                                                   resultType, ValueRange());
+                                                   resultType, dynDims);
     int64_t upperBound = 0;
     for (auto &&operand : adaptor.getOperands()) {
       auto operandType = operand.getType().cast<ShapedType>();
-      offsets[axis] = rewriter.getI64IntegerAttr(upperBound);
-      sizes[axis] = rewriter.getI64IntegerAttr(operandType.getDimSize(axis));
+      static_offsets[axis] = upperBound;
+      static_sizes[axis] = operandType.getDimSize(axis);
       value = rewriter.create<tensor::InsertSliceOp>(
-          concatOp->getLoc(), operand, value, offsets, sizes, strides);
+          concatOp->getLoc(), operand, value, ValueRange(), sizes, ValueRange(),
+          static_offsets, static_sizes, static_strides);
       upperBound += operandType.getDimSize(axis);
     }
     rewriter.replaceOp(concatOp, value);
@@ -338,11 +360,14 @@ public:
       return rewriter.notifyMatchFailure(op, "collapsed_slice_dims != [0]");
     }
 
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, "IndexSelectOp", adaptor.getOperands(), appendArgTypes);
-
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
     // FIXME: currently only support select starting from 0
-    computeOp->setAttr("dim", rewriter.getI32IntegerAttr(0));
+    computeOnTensorOp->setAttr("dim", rewriter.getI32IntegerAttr(0));
 
     return success();
   }
@@ -373,11 +398,14 @@ public:
       return rewriter.notifyMatchFailure(op, "unsupported block in scatter");
     }
 
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, "IndexPutOp", adaptor.getOperands(), appendArgTypes);
-
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
     // FIXME: currently only support select on dim0
-    computeOp->setAttr("dim", rewriter.getI32IntegerAttr(0));
+    computeOnTensorOp->setAttr("dim", rewriter.getI32IntegerAttr(0));
 
     return success();
   }
@@ -399,13 +427,16 @@ public:
         adaptor.getRhs().getType().cast<ShapedType>().getRank() != 2)
       return failure();
 
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, "MatmulOp", adaptor.getOperands(), appendArgTypes);
-
-    computeOp->setAttr("lhs_contracting_dimension",
-                       rewriter.getI64IntegerAttr(1));
-    computeOp->setAttr("rhs_contracting_dimension",
-                       rewriter.getI64IntegerAttr(0));
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
+    computeOnTensorOp->setAttr("lhs_contracting_dimension",
+                               rewriter.getI64IntegerAttr(1));
+    computeOnTensorOp->setAttr("rhs_contracting_dimension",
+                               rewriter.getI64IntegerAttr(0));
     return success();
   }
 
@@ -430,19 +461,24 @@ public:
     assert(dotDimensionNumbers.getRhsContractingDimensions().size() == 1);
     if (dotDimensionNumbers.getLhsBatchingDimensions().size() == 0) {
 
-      auto computeOp = replaceMhloOpWithByreComputeOp(
+      auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
           rewriter, op, "MatmulOp", adaptor.getOperands(), appendArgTypes);
-
+      if (failed(failureOrComputeOnTensorOp)) {
+        return failure();
+      }
+      auto computeOnTensorOp = *failureOrComputeOnTensorOp;
       // append attribute 'lhsContractingDimension' and
       // 'rhsContractingDimension'
       int64_t lhsContractingDimension =
           dotDimensionNumbers.getLhsContractingDimensions()[0];
       int64_t rhsContractingDimension =
           dotDimensionNumbers.getRhsContractingDimensions()[0];
-      computeOp->setAttr("lhs_contracting_dimension",
-                         rewriter.getI64IntegerAttr(lhsContractingDimension));
-      computeOp->setAttr("rhs_contracting_dimension",
-                         rewriter.getI64IntegerAttr(rhsContractingDimension));
+      computeOnTensorOp->setAttr(
+          "lhs_contracting_dimension",
+          rewriter.getI64IntegerAttr(lhsContractingDimension));
+      computeOnTensorOp->setAttr(
+          "rhs_contracting_dimension",
+          rewriter.getI64IntegerAttr(rhsContractingDimension));
     } else {
       // convert to BatchMatmulOp
       SmallVector<int64_t> batchingDimensions;
@@ -459,9 +495,12 @@ public:
                << "can not handle unregular batching_dimensions";
       }
 
-      auto computeOp = replaceMhloOpWithByreComputeOp(
+      auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
           rewriter, op, "BatchMatmulOp", adaptor.getOperands(), appendArgTypes);
-
+      if (failed(failureOrComputeOnTensorOp)) {
+        return failure();
+      }
+      auto computeOnTensorOp = *failureOrComputeOnTensorOp;
       // append attributes of batching and contracting dimensions
       int64_t lhsContractingDimension =
           dotDimensionNumbers.getLhsContractingDimensions()[0];
@@ -471,14 +510,18 @@ public:
           dotDimensionNumbers.getLhsBatchingDimensions();
       auto rhsBatchingDimensions =
           dotDimensionNumbers.getRhsBatchingDimensions();
-      computeOp->setAttr("lhs_contracting_dimension",
-                         rewriter.getI64IntegerAttr(lhsContractingDimension));
-      computeOp->setAttr("rhs_contracting_dimension",
-                         rewriter.getI64IntegerAttr(rhsContractingDimension));
-      computeOp->setAttr("lhs_batching_dimensions",
-                         rewriter.getI64ArrayAttr(lhsBatchingDimensions));
-      computeOp->setAttr("rhs_batching_dimensions",
-                         rewriter.getI64ArrayAttr(rhsBatchingDimensions));
+      computeOnTensorOp->setAttr(
+          "lhs_contracting_dimension",
+          rewriter.getI64IntegerAttr(lhsContractingDimension));
+      computeOnTensorOp->setAttr(
+          "rhs_contracting_dimension",
+          rewriter.getI64IntegerAttr(rhsContractingDimension));
+      computeOnTensorOp->setAttr(
+          "lhs_batching_dimensions",
+          rewriter.getI64ArrayAttr(lhsBatchingDimensions));
+      computeOnTensorOp->setAttr(
+          "rhs_batching_dimensions",
+          rewriter.getI64ArrayAttr(rhsBatchingDimensions));
     }
     return success();
   }
@@ -500,9 +543,13 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     NamedAttrList attrs;
     handleConvAttribute(attrs, op, rewriter);
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, "ConvOp", adaptor.getOperands(), appendArgTypes);
-    addAttrs(computeOp.getOperation(), attrs.getAttrs());
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
+    addAttrs(computeOnTensorOp.getOperation(), attrs.getAttrs());
     return success();
   }
 
@@ -569,10 +616,13 @@ public:
             op, "only consecutive dimensions were support");
     }
 
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, reduceOp, adaptor.getInputs(), appendArgTypes);
-
-    computeOp->setAttr("dimensions", op.getDimensionsAttr());
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
+    computeOnTensorOp->setAttr("dimensions", op.getDimensionsAttr());
 
     return success();
   }
@@ -616,22 +666,26 @@ public:
     }
 
     auto &block = region.front();
-    std::string byreComputeOpName = "";
+    std::string byrecomputeOnTensorOpName = "";
     if (isBlockSingleOp<mhlo::MaxOp>(&block) &&
         isMinValueAttribute(constAttr)) {
-      byreComputeOpName = "PoolMaxOp";
+      byrecomputeOnTensorOpName = "PoolMaxOp";
     } else if (isBlockSingleOp<mhlo::AddOp>(&block) &&
                isZeroAttribute(constAttr)) {
-      byreComputeOpName = "PoolSumOp";
+      byrecomputeOnTensorOpName = "PoolSumOp";
     } else {
       return rewriter.notifyMatchFailure(op, "unsupport reduce_window");
     }
 
-    auto computeOp = replaceMhloOpWithByreComputeOp(
-        rewriter, op, byreComputeOpName, adaptor.getInputs(), appendArgTypes);
-
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
+        rewriter, op, byrecomputeOnTensorOpName, adaptor.getInputs(),
+        appendArgTypes);
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
     for (auto attr : op->getAttrs()) {
-      computeOp->setAttr(attr.getName(), attr.getValue());
+      computeOnTensorOp->setAttr(attr.getName(), attr.getValue());
     }
 
     return success();
@@ -688,11 +742,14 @@ public:
 
     // TODO: more SelectAndScatterOp supported
     std::string poolingGradOp = "PoolMaxGradOp";
-    auto computeOp = replaceMhloOpWithByreComputeOp(
+    auto failureOrComputeOnTensorOp = replaceMhloOpWithByreComputeOnTensorOp(
         rewriter, op, poolingGradOp,
         ValueRange{adaptor.getOperand(), adaptor.getSource()}, appendArgTypes);
-
-    addAttrs(computeOp, op->getAttrs());
+    if (failed(failureOrComputeOnTensorOp)) {
+      return failure();
+    }
+    auto computeOnTensorOp = *failureOrComputeOnTensorOp;
+    addAttrs(computeOnTensorOp, op->getAttrs());
     return success();
   }
 };
@@ -704,9 +761,7 @@ public:
       : ConvertHloToByreTensorBase() {
     this->appendArgTypes = appendArgTypes;
 
-    supportMap.insert({"mhlo.add", "AddOp"});
     supportMap.insert({"mhlo.transpose", "TransposeOp"});
-    supportMap.insert({"mhlo.convert", "Typecvt"});
   }
 
   void runOnOperation() override {
@@ -718,7 +773,7 @@ public:
     populateHloToByreTensorPattern(patterns, supportMap, appendArgTypes);
     target.addIllegalDialect<mhlo::MhloDialect>();
     target.addLegalDialect<tensor::TensorDialect, byre::ByreDialect,
-                           arith::ArithDialect>();
+                           shape::ShapeDialect, arith::ArithDialect>();
 
     FrozenRewritePatternSet frozenPatterns(std::move(patterns));
     if (failed(applyPartialConversion(funcOp, target, frozenPatterns))) {
@@ -749,9 +804,10 @@ void mlir::populateHloToByreTensorPattern(
                ConvertSelectAndScatterOpToByrePattern>(patterns.getContext(),
                                                        appendArgTypes);
 
-  patterns.add<ConvertConstLikeOp<mhlo::ConstantOp>,
-               ConvertConstLikeOp<ace::ConstOp>, ConvertReshapeOp,
-               ConvertSliceOp, ConvertConcatenateOp>(patterns.getContext());
+  patterns.add<
+      ConvertConstLikeOp<mhlo::ConstantOp>, ConvertConstLikeOp<ace::ConstOp>,
+      ConvertReshapeOp<mhlo::ReshapeOp>, ConvertReshapeOp<ace::ReshapeOp>,
+      ConvertSliceOp, ConvertConcatenateOp>(patterns.getContext());
 }
 
 std::unique_ptr<OperationPass<func::FuncOp>>

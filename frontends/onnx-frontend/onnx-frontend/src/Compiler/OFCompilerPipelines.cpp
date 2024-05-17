@@ -25,8 +25,9 @@
 
 namespace onnx_frontend {
 
-void addCustomizedONNXToMhloPasses(
-    mlir::PassManager &pm, const std::vector<std::string> &customCallOps) {
+void addCustomizedONNXToStablehloPasses(
+    mlir::PassManager &pm, const std::vector<std::string> &customCallOps,
+    bool enableUnroll) {
 
   // Statically add passes for shape inference
   for (int i = 0; i < onnx_frontend::ofRepeatStatic; i++) {
@@ -41,12 +42,18 @@ void addCustomizedONNXToMhloPasses(
   // convert coarse-grained onnx ops to byteir.xxx custom calls
   for (int i = 0; i < 2; i++) {
     pm.addNestedPass<mlir::func::FuncOp>(
+        onnx_frontend::createOFRewriteCustomOnnxOpsPass());
+    pm.addNestedPass<mlir::func::FuncOp>(
         onnx_frontend::createOFRewriteToCustomCallPass(customCallOps));
     pm.addNestedPass<mlir::func::FuncOp>(
-        onnx_mlir::createDecomposeONNXToONNXPass("mhlo"));
-    pm.addPass(onnx_mlir::createShapeInferencePass());
-    pm.addPass(onnx_frontend::createOFCanonicalizerPass());
-    pm.addPass(onnx_mlir::createShapeInferencePass());
+        onnx_mlir::createDecomposeONNXToONNXPass("stablehlo"));
+    for (int i = 0; i < onnx_frontend::ofRepeatStatic; i++) {
+      pm.addPass(onnx_mlir::createShapeInferencePass());
+      pm.addPass(onnx_frontend::createOFCanonicalizerPass());
+      pm.addPass(onnx_mlir::createShapeInferencePass());
+      pm.addNestedPass<mlir::func::FuncOp>(
+          onnx_mlir::createConstPropONNXToONNXPass());
+    }
   }
 
   // There are more opportunities for const propagation once all tensors have
@@ -57,7 +64,8 @@ void addCustomizedONNXToMhloPasses(
   if (onnx_frontend::ofRepeatDynamicMax > 0) {
     // Dynamic iterate in ONNXOpTransformPass
     pm.addPass(onnx_mlir::createONNXOpTransformPass(
-        onnx_frontend::ofRepeatStatic, /*report=*/false, false, false));
+        onnx_frontend::ofRepeatStatic, /*report=*/false, false, false, true,
+        false));
   } else {
     // Statically add extra passes
     for (int i = 0; i < onnx_frontend::ofRepeatStatic; i++) {
@@ -73,10 +81,14 @@ void addCustomizedONNXToMhloPasses(
   pm.addPass(mlir::createSymbolDCEPass());
 
   pm.addPass(onnx_frontend::createOFModifyEntryPointPass());
-  pm.addPass(onnx_mlir::createLowerToMhloPass());
+  pm.addPass(onnx_mlir::createLowerToStablehloPass(enableUnroll));
   pm.addPass(onnx_frontend::createOFCanonicalizerPass());
   (void)mlir::applyPassManagerCLOptions(pm);
   mlir::applyDefaultTimingPassManagerCLOptions(pm);
+}
+
+void addVerifyONNXToStablehloPasses(mlir::PassManager &pm) {
+  pm.addPass(onnx_frontend::createOFCheckNonLoweredPass());
 }
 
 } // namespace onnx_frontend

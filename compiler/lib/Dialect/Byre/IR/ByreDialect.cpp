@@ -31,10 +31,10 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/DialectImplementation.h"
-#include "mlir/IR/FunctionImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include <algorithm> // for std::any_of
@@ -249,14 +249,6 @@ LogicalResult ByreDialect::verifyOperationAttribute(Operation *op,
                << func::FuncOp::getOperationName() << "' under '"
                << ModuleOp::getOperationName() << '\'';
       }
-    }
-
-    if (!numOutputs) {
-      return op->emitError(
-                 "expected at least 1 argument which was attached with '")
-             << ByreDialect::getEntryPointFuncArgTypeAttrName()
-             << "' attribute contained '"
-             << stringifyEnum(EntryFuncArgType::Output) << '\'';
     }
 
     // FuncOp has no return
@@ -492,6 +484,31 @@ void AliasOp::getCanonicalizationPatterns(RewritePatternSet &results,
 std::string AliasOp::getCalleeName() { return "AliasOp"; }
 
 Value AliasOp::getViewSource() { return getSource(); }
+
+//===----------------------------------------------------------------------===//
+// CustomOp
+//===----------------------------------------------------------------------===/
+
+void CustomOp::build(OpBuilder &builder, OperationState &result,
+                     StringRef lib_path, StringRef api_name, StringRef version,
+                     ValueRange inputs, ValueRange outputs,
+                     ArrayAttr extra_args) {
+  SmallVector<Attribute> memoryEffectAttrs;
+  memoryEffectAttrs.append(
+      inputs.size(), builder.getAttr<MemoryEffectAttr>(MemoryEffect::Read));
+  memoryEffectAttrs.append(
+      outputs.size(), builder.getAttr<MemoryEffectAttr>(MemoryEffect::Write));
+  build(builder, result, TypeRange{}, lib_path, api_name, version,
+        llvm::to_vector(llvm::concat<Value>(llvm::to_vector(inputs),
+                                            llvm::to_vector(outputs))),
+        extra_args, builder.getArrayAttr(memoryEffectAttrs));
+}
+
+std::string CustomOp::getCalleeName() { return "custom"; }
+
+LogicalResult CustomOp::verify() {
+  return verifyOpInEntryPointFunc(this->getOperation());
+}
 
 // LWC: ignore Async for now
 //

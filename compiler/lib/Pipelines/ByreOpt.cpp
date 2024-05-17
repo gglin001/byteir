@@ -26,7 +26,7 @@
 #include "byteir/Pipelines/Common/Utils.h"
 #include "byteir/Transforms/Passes.h"
 #include "byteir/Utils/Utils.h"
-#include "lhlo/IR/lhlo_ops.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Transforms/Passes.h"
 
 using namespace mlir;
@@ -48,7 +48,10 @@ void createByreOptPipelineImpl(OpPassManager &pm, const std::string &entryFunc,
   OpPassManager anchoredPM(func::FuncOp::getOperationName());
   if (!disableMemoryPlanning) {
     // underlying memory of constant op cannot be reused
-    anchoredPM.addPass(createMemoryPlanningPass(128, nullptr));
+    anchoredPM.addPass(createMemoryPlanningPass(/* alignment */ 128,
+                                                /* alloca */ false,
+                                                /* memory space */ 0,
+                                                /* callback */ nullptr));
     anchoredPM.addPass(createCanonicalizerPass());
   }
   anchoredPM.addPass(createConvertMemrefToByrePass());

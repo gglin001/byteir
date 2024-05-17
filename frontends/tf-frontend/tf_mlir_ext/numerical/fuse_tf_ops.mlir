@@ -1,10 +1,10 @@
 // RUN: tf-ext-opt -fuse-tf-ops %s -o %t0
 // RUN: FileCheck %s < %t0
-// RUN: python3 numerical_test.py %s %t0
+// RUN: python3 numerical_test.py %s %t0 --config fuse_tf_ops
 
 // RUN: tf-ext-opt -fuse-tf-ops -xla-legalize-tf -canonicalize %s -o %t1
 // RUN: FileCheck %s < %t1 --check-prefix MHLO
-// RUN: python3 numerical_test.py %s %t0
+// RUN: python3 numerical_test.py %s %t0 --config fuse_tf_ops
 
 func.func @dilated_conv3d(%70: tensor<1x100x27x48x32xf32>, %cst_32: tensor<3x1x1x32x16xf32>) -> tensor<1x100x27x48x16xf32> {
   %crops = "tf.Const"() {device = "", value = dense<0> : tensor<3x2xi32>} : () -> tensor<3x2xi32>
@@ -16,7 +16,7 @@ func.func @dilated_conv3d(%70: tensor<1x100x27x48x32xf32>, %cst_32: tensor<3x1x1
   return %73 : tensor<1x100x27x48x16xf32>
 }
 // CHECK-LABEL: @dilated_conv3d
-// CHECK-NEXT:  %0 = "tf.Conv3D"(%arg0, %arg1) {data_format = "NDHWC", device = "", dilations = [1, 2, 1, 1, 1], padding = "SAME", strides = [1, 1, 1, 1, 1]} : (tensor<1x100x27x48x32xf32>, tensor<3x1x1x32x16xf32>) -> tensor<1x100x27x48x16xf32>
+// CHECK-NEXT:  %0 = "tf.Conv3D"(%arg0, %arg1) <{data_format = "NDHWC", dilations = [1, 2, 1, 1, 1], padding = "SAME", strides = [1, 1, 1, 1, 1]}> {device = ""} : (tensor<1x100x27x48x32xf32>, tensor<3x1x1x32x16xf32>) -> tensor<1x100x27x48x16xf32>
 
 // MHLO-LABEL: @dilated_conv3d
 // MHLO-NEXT:  %0 = mhlo.convolution(%arg0, %arg1) dim_numbers = [b, 0, 1, 2, f]x[0, 1, 2, i, o]->[b, 0, 1, 2, f], window = {stride = [1, 1, 1], pad = {{\[}}[2, 2], [0, 0], [0, 0]{{\]}}, rhs_dilate = [2, 1, 1]} {batch_group_count = 1 : i64, feature_group_count = 1 : i64, precision_config = [#mhlo<precision DEFAULT>, #mhlo<precision DEFAULT>]} : (tensor<1x100x27x48x32xf32>, tensor<3x1x1x32x16xf32>) -> tensor<1x100x27x48x16xf32>

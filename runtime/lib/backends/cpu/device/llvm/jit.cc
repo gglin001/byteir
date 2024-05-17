@@ -137,6 +137,18 @@ createRTDyldObjectLinkingLayerWithGDBListner(llvm::orc::ExecutionSession &ES,
   return std::unique_ptr<llvm::orc::ObjectLayer>(std::move(Layer));
 }
 
+llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>>
+createRTDyldObjectLinkingLayer(llvm::orc::ExecutionSession &ES,
+                               const llvm::Triple &TT) {
+  auto GetMemMgr = []() {
+    return std::make_unique<llvm::SectionMemoryManager>();
+  };
+  auto Layer = std::make_unique<llvm::orc::RTDyldObjectLinkingLayer>(
+      ES, std::move(GetMemMgr));
+
+  return std::unique_ptr<llvm::orc::ObjectLayer>(std::move(Layer));
+}
+
 inline std::string makePackedFunctionName(llvm::StringRef name) {
   return "_packed_" + name.str();
 }
@@ -155,9 +167,9 @@ void packFunctionArguments(llvm::Module *module) {
 
     // Given a function `foo(<...>)`, define the interface function
     // `mlir_foo(i8**)`.
-    auto *newType = llvm::FunctionType::get(
-        builder.getVoidTy(), builder.getInt8PtrTy()->getPointerTo(),
-        /*isVarArg=*/false);
+    auto *newType = llvm::FunctionType::get(builder.getVoidTy(),
+                                            builder.getPtrTy()->getPointerTo(),
+                                            /*isVarArg=*/false);
     auto newName = makePackedFunctionName(func.getName());
     auto funcCst = module->getOrInsertFunction(newName, newType);
     llvm::Function *interfaceFunc =
@@ -176,9 +188,8 @@ void packFunctionArguments(llvm::Module *module) {
       llvm::Value *argIndex = llvm::Constant::getIntegerValue(
           builder.getInt64Ty(), llvm::APInt(64, indexedArg.index()));
       llvm::Value *argPtrPtr =
-          builder.CreateGEP(builder.getInt8PtrTy(), argList, argIndex);
-      llvm::Value *argPtr =
-          builder.CreateLoad(builder.getInt8PtrTy(), argPtrPtr);
+          builder.CreateGEP(builder.getPtrTy(), argList, argIndex);
+      llvm::Value *argPtr = builder.CreateLoad(builder.getPtrTy(), argPtrPtr);
       llvm::Type *argTy = indexedArg.value().getType();
       argPtr = builder.CreateBitCast(argPtr, argTy->getPointerTo());
       llvm::Value *arg = builder.CreateLoad(argTy, argPtr);
@@ -193,9 +204,8 @@ void packFunctionArguments(llvm::Module *module) {
       llvm::Value *retIndex = llvm::Constant::getIntegerValue(
           builder.getInt64Ty(), llvm::APInt(64, llvm::size(func.args())));
       llvm::Value *retPtrPtr =
-          builder.CreateGEP(builder.getInt8PtrTy(), argList, retIndex);
-      llvm::Value *retPtr =
-          builder.CreateLoad(builder.getInt8PtrTy(), retPtrPtr);
+          builder.CreateGEP(builder.getPtrTy(), argList, retIndex);
+      llvm::Value *retPtr = builder.CreateLoad(builder.getPtrTy(), retPtrPtr);
       retPtr = builder.CreateBitCast(retPtr, result->getType()->getPointerTo());
       builder.CreateStore(result, retPtr);
     }
@@ -263,6 +273,11 @@ extern "C" void memrefCopy(int64_t elemSize,
   }
 }
 
+extern "C" uint16_t __truncdfhf2(double v) {
+  return _cvtss_sh(static_cast<float>(v),
+                   _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+}
+
 void InitJITKernelRTSymbols(LLVMJIT *jit) {
 #define REG2(name, symbol)                                                     \
   if (!jit->Lookup(name, nullptr).IsOK()) {                                    \
@@ -272,6 +287,7 @@ void InitJITKernelRTSymbols(LLVMJIT *jit) {
 #define REG(symbol) REG2(#symbol, symbol)
 
   REG(memrefCopy);
+  REG(__truncdfhf2);
   // TODO: replace with the call of session host allocator's corresponding
   // method
   REG2("malloc", ::malloc);
@@ -329,8 +345,11 @@ LLVMJITImpl::LLVMJITImpl(Options opt) : options(opt) {
                             .create(),
                         "failed to create lljit builder");
   } else {
-    jit = checkAndThrow(llvm::orc::LLJITBuilder().create(),
-                        "failed to create lljit builder");
+    jit = checkAndThrow(
+        llvm::orc::LLJITBuilder()
+            .setObjectLinkingLayerCreator(createRTDyldObjectLinkingLayer)
+            .create(),
+        "failed to create lljit builder");
   }
 
   // Make sure that our process symbols are visible to JIT'd code.
@@ -390,9 +409,11 @@ common::Status LLVMJITImpl::ParseIRFile(const std::string &path) {
   llvm::SMDiagnostic err;
   auto mod = llvm::parseIRFile(path, err, *ctx);
   if (!mod) {
-    // TODO: handle err message
+    std::string buf;
+    llvm::raw_string_ostream OS(buf);
+    err.print("parse-ir-file", OS);
     return common::Status(common::StatusCategory::BRT, common::StatusCode::FAIL,
-                          "Parse LLVM module failed");
+                          "Parse LLVM module failed : " + buf);
   }
   mod->setModuleIdentifier(path);
 

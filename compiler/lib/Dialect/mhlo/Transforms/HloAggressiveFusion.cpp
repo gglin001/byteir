@@ -18,6 +18,7 @@
 #include "byteir/Dialect/mhlo/Transforms/HloFuser.h"
 
 #include "byteir/Dialect/mhlo/Transforms/GenericFusionCommon.h"
+#include "byteir/Dialect/mhlo/Util/CustomCallUtil.h"
 #include "byteir/Dialect/mhlo/Util/FusionUtil.h"
 #include "byteir/Dialect/mhlo/Util/Util.h"
 #include "byteir/Utils/IRRewrite.h"
@@ -35,7 +36,23 @@ using namespace mlir::mhlo;
 namespace {
 namespace aggressive_fusion {
 
+bool isCustomMhloRngUniformOp(Operation *op) {
+  if (auto customOp = llvm::dyn_cast_or_null<mhlo::CustomCallOp>(op)) {
+    return customOp.getCallTargetName() == getRngUniformName();
+  }
+  return false;
+}
+
+bool isCustomMhloByteirRepeatOp(Operation *op) {
+  if (auto customOp = llvm::dyn_cast_or_null<mhlo::CustomCallOp>(op)) {
+    return customOp.getCallTargetName() == getRepeatName();
+  }
+  return false;
+}
+
 bool isFusibleCandidate(Operation *op) {
+  if (isCustomMhloRngUniformOp(op) || isCustomMhloByteirRepeatOp(op))
+    return true;
   return isMhlo(op) && !llvm::isa<mhlo::CustomCallOp>(op);
 }
 
@@ -45,14 +62,22 @@ bool isFusibleTrigger(Operation *) { return true; }
 
 bool isFusibleWith(Operation *, Operation *) { return true; }
 
-bool isValidSingleOp(Operation *) { return true; }
+bool isValidSingleOp(Operation *op) {
+  if (llvm::isa<mhlo::ReshapeOp>(op))
+    return false;
+  else
+    return true;
+}
+
+bool isValidFusionPattern(const MhloFusionPattern &) { return true; }
 
 static GenericFuserConfig config{getByteIRHloAggressiveFusionAttrName(),
                                  aggressive_fusion::isFusibleCandidate,
                                  aggressive_fusion::isFusibleStart,
                                  aggressive_fusion::isFusibleTrigger,
                                  aggressive_fusion::isFusibleWith,
-                                 aggressive_fusion::isValidSingleOp};
+                                 aggressive_fusion::isValidSingleOp,
+                                 aggressive_fusion::isValidFusionPattern};
 
 } // namespace aggressive_fusion
 

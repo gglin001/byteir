@@ -26,9 +26,8 @@
 #include "brt/core/ir/util.h"
 #include "byteir/Dialect/Byre/ByreDialect.h"
 #include <unordered_set>
-
-// TODO avoid using USE_CUDA
-#if USE_CUDA
+// TODO avoid using BRT_USE_CUDA
+#if BRT_USE_CUDA
 #include "brt/backends/cuda/device/cuda_work_queue.h"
 #endif
 
@@ -63,7 +62,8 @@ GetAllocator(const std::unordered_map<std::string, std::unique_ptr<IAllocator>>
 common::Status StaticBRTExecutionPlan::ProloguePerSession(
     const std::unordered_map<std::string, std::unique_ptr<IAllocator>>
         &allocators,
-    const std::vector<std::unique_ptr<ExecutionProvider>> &providers) {
+    const std::vector<std::unique_ptr<ExecutionProvider>> &providers,
+    const Device dev, const DeviceAPI *device_api) {
   std::unordered_set<void *> visited_ptrs;
   std::unordered_set<void *> visited_allocator_ptrs;
 
@@ -74,8 +74,8 @@ common::Status StaticBRTExecutionPlan::ProloguePerSession(
 
   // handle func args weight/input/output but allocate weight only
   size_t arg_count = 0;
-  auto status_iterate_entry_args =
-      graph_.IterateEntryFuncArg([&](mlir::BlockArgument block_arg) {
+  auto status_iterate_entry_args = graph_.IterateEntryFuncArg(
+      [&](mlir::BlockArgument block_arg, mlir::DictionaryAttr arg_attrs) {
         void *arg_ptr = block_arg.getAsOpaquePointer();
 
         // early terminate when nullptr
@@ -111,6 +111,40 @@ common::Status StaticBRTExecutionPlan::ProloguePerSession(
             // allocate weights
             // TODO handle alignment
             auto ptr = cur_allocator->Alloc(allocate_size);
+            // load weight from weight_value attr
+            if (arg_attrs.get(mlir::byre::ByreDialect::
+                                  getEntryPointFuncArgWeightValueAttrName())) {
+              auto dtype = ConvertMLIRTypeToDType(memref.getElementType());
+              auto weight_attr =
+                  arg_attrs
+                      .get(mlir::byre::ByreDialect::
+                               getEntryPointFuncArgWeightValueAttrName())
+                      .dyn_cast_or_null<DenseElementsAttr>();
+              // If mlir's data storage changed, fix here like i1 dtype
+              if (weight_attr == nullptr) {
+                return Status(BRT, FAIL,
+                              "weight value is not of type DenseElementsAttr");
+              }
+
+              if (device_api == nullptr) {
+                return Status(BRT, FAIL, "nullptr device_api");
+              }
+
+              if (dtype == DTypeEnum::Bool) {
+                auto dense_int_attr = weight_attr.cast<DenseIntElementsAttr>();
+                std::vector<char> host_data;
+                host_data.reserve(allocate_size);
+                for (APInt &&i : dense_int_attr) {
+                  host_data.push_back(static_cast<char>(i.getSExtValue()));
+                }
+                device_api->MemcpyH2D(dev, ptr, host_data.data(),
+                                      allocate_size);
+              } else {
+                void *host_data_ptr = reinterpret_cast<void *>(
+                    const_cast<char *>(weight_attr.getRawData().data()));
+                device_api->MemcpyH2D(dev, ptr, host_data_ptr, allocate_size);
+              }
+            }
             frame_construct_info_.weights.push_back(ptr);
           }
         } else {
@@ -119,6 +153,7 @@ common::Status StaticBRTExecutionPlan::ProloguePerSession(
 
         return Status::OK();
       });
+
   if (!status_iterate_entry_args.IsOK()) {
     return status_iterate_entry_args;
   }
@@ -207,6 +242,76 @@ common::Status StaticBRTExecutionPlan::ProloguePerSession(
   if (!status_internal.IsOK())
     return status_internal;
 
+  // handle op dependency
+  // TODO: move to compiler
+  llvm::DenseMap<Value, Operation *> dependent_op;
+  graph_.IterateNode([&](Operation *op) {
+    if (auto compute_op = llvm::dyn_cast<byre::ComputeOp>(op)) {
+      auto memory_effects = compute_op.getMemoryEffects();
+      if (memory_effects.has_value()) {
+        auto memory_effects_val = memory_effects.value();
+        if (op->getNumOperands() != memory_effects_val.size()) {
+          const std::string &key = ByREHandle::GetKey(compute_op);
+          status_internal = Status(
+              BRT, FAIL,
+              "expect memory effects size equals to number of operands " + key);
+          return WalkResult::interrupt();
+        }
+        for (size_t i = 0; i < memory_effects_val.size(); i++) {
+          auto memory_effect_attr =
+              memory_effects_val[i].cast<byre::MemoryEffectAttr>().getValue();
+          if (memory_effect_attr == byre::MemoryEffect::Read) {
+            // Read from operand, update dependency_graph
+            if (dependent_op.count(op->getOperand(i)) > 0) {
+              frame_construct_info_.dependency_graph[op].push_back(
+                  dependent_op[op->getOperand(i)]);
+            }
+          } else if (memory_effect_attr == byre::MemoryEffect::Write) {
+            // Write to operand, update dependent_op
+            dependent_op[op->getOperand(i)] = op;
+          } else {
+            // Read then Write
+            if (dependent_op.count(op->getOperand(i)) > 0) {
+              frame_construct_info_.dependency_graph[op].push_back(
+                  dependent_op[op->getOperand(i)]);
+            }
+            dependent_op[op->getOperand(i)] = op;
+          }
+        }
+      } else {
+        // no memory effect detected. Assume read & write for all operands.
+        for (int i = 0; i < op->getNumOperands(); ++i) {
+          Value operand = op->getOperand(i);
+          if (dependent_op.count(operand) > 0) {
+            frame_construct_info_.dependency_graph[op].push_back(
+                dependent_op[operand]);
+          }
+          dependent_op[operand] = op;
+        }
+      }
+    } else if (auto copy_op = llvm::dyn_cast<byre::CopyOp>(op)) {
+      if (dependent_op.count(op->getOperand(0)) > 0) {
+        frame_construct_info_.dependency_graph[op].push_back(
+            dependent_op[op->getOperand(0)]);
+      }
+      dependent_op[op->getOperand(1)] = op;
+    } else if (auto groupcopy_op = llvm::dyn_cast<byre::GroupCopyOp>(op)) {
+      for (auto operand : groupcopy_op.getSource()) {
+        if (dependent_op.count(operand) > 0) {
+          frame_construct_info_.dependency_graph[op].push_back(
+              dependent_op[operand]);
+        }
+      }
+      for (auto target : groupcopy_op.getTarget()) {
+        dependent_op[target] = op;
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (!status_internal.IsOK())
+    return status_internal;
+
+  std::unordered_map<Operation *, int> op_to_id_map;
   // create op kernel, generate tensor id and mapping IR value to it
   graph_.IterateNode([&](Operation *op) {
     if (auto byre_op = dyn_cast<byre::ByreOp>(op)) {
@@ -277,12 +382,27 @@ common::Status StaticBRTExecutionPlan::ProloguePerSession(
         if (IsAliasOp(byre_op))
           break;
 
+        if (frame_construct_info_.dependency_graph.count(op) == 0) {
+          frame_construct_info_.dependency_graph[op] = {};
+        }
         // creat an OpKerenl based on the hitting provider
-        OpKernelInfo op_kernel_info(*provider, graph_, op, allocators,
-                                    last_alloc, graph_info_.tensor_to_id,
-                                    graph_info_.scalar_to_id,
-                                    frame_construct_info_.weights,
-                                    intermediate_begin, graph_.GetIRPath());
+        int op_id = op_kernels_.size();
+        op_to_id_map[op] = op_id;
+        std::vector<int> dependency_list;
+        for (Operation *dep_op : frame_construct_info_.dependency_graph[op]) {
+          if (op_to_id_map.find(dep_op) != op_to_id_map.end()) {
+            dependency_list.push_back(op_to_id_map[dep_op]);
+          } else {
+            status_internal = Status(BRT, FAIL, " op_to_id_map op not found ");
+            return WalkResult::interrupt();
+          }
+        }
+
+        OpKernelInfo op_kernel_info(
+            *provider, graph_, op, op_id, allocators, last_alloc,
+            graph_info_.tensor_to_id, graph_info_.scalar_to_id,
+            frame_construct_info_.weights, intermediate_begin,
+            graph_.GetIRPath(), dependency_list);
 
         auto op_ptr = (*registry)(key, op_kernel_info);
 
@@ -471,13 +591,14 @@ common::Status StaticBRTExecutionPlan::EpiloguePerSession() {
   return common::Status::OK();
 }
 
-void StaticBRTExecutionPlan::CreateWorkQueue(std::unique_ptr<WorkQueue> *wq) {
+void StaticBRTExecutionPlan::CreateWorkQueue(std::unique_ptr<WorkQueue> *wq,
+                                             int rank) {
   // create WQ
   // TODO remove this
-  // TODO avoid using USE_CUDA
-#if USE_CUDA
+  // TODO avoid using BRT_USE_CUDA
+#if BRT_USE_CUDA
   // wq_ = std::unique_ptr<WorkQueue>(new CUDAWorkQueue());
-  *wq = std::unique_ptr<WorkQueue>(new CUDASingleStreamWorkQueue(0));
+  *wq = std::unique_ptr<WorkQueue>(new CUDASingleStreamWorkQueue(rank));
 #endif
 }
 

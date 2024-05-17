@@ -15,9 +15,6 @@ add_mlir_public_c_api_library(ByteIRCAPI
   # conversion passes
   ByteIRGPUToNVVM
   ByteIRHloToCat
-  ByteIRHloToLhlo
-  ByteIRLmhloToLace
-  ByteIRLmhloToMemref
   ByteIRToAce
   ByteIRToAIT
   ByteIRToByre
@@ -26,6 +23,7 @@ add_mlir_public_c_api_library(ByteIRCAPI
   ByteIRToLinalg
   ByteIRToLLVM
   ByteIRToPTX
+  ByteIRLcclToByre
 
   # transofrm passes
   ByteIRTransforms
@@ -33,6 +31,7 @@ add_mlir_public_c_api_library(ByteIRCAPI
   # dialect specific passes
   ByteIRAffinePasses
   ByteIRByrePasses
+  ByteIRGPUPasses
   ByteIRLinalgPasses
   ByteIRMemRefPasses
   ByteIRMhloPasses

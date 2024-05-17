@@ -43,11 +43,36 @@ bool anyIncompatibleUse(Value oldValue, Value newValue) {
                       [](OpOperand &operand) {
                         Operation *op = operand.getOwner();
                         Dialect *dialect = op->getDialect();
-                        return llvm::isa<memref::CollapseShapeOp, func::CallOp>(
-                                   op) ||
+                        return llvm::isa<memref::CollapseShapeOp, func::CallOp,
+                                         memref::ExpandShapeOp>(op) ||
                                (dialect && dialect->getNamespace() == "byre");
                       }) &&
          (oldValue.getType() != newValue.getType());
+}
+
+bool anyIncompatibleUseExceptReshapeOp(Value oldValue, Value newValue) {
+  return llvm::any_of(oldValue.getUses(),
+                      [](OpOperand &operand) {
+                        Operation *op = operand.getOwner();
+                        Dialect *dialect = op->getDialect();
+                        return llvm::isa<func::CallOp>(op) ||
+                               (dialect && dialect->getNamespace() == "byre");
+                      }) &&
+         (oldValue.getType() != newValue.getType());
+}
+
+SmallVector<Operation *> getReshapeOp(Value value) {
+  SmallVector<Operation *> reshapeOps;
+  auto operation = value.getDefiningOp();
+  while (operation &&
+         isa<memref::CollapseShapeOp, memref::ExpandShapeOp>(operation)) {
+    reshapeOps.push_back(operation);
+    value = operation->getOperand(0);
+    operation = value.getDefiningOp();
+  }
+  if (operation && isa<memref::AllocOp>(operation))
+    return reshapeOps;
+  return {};
 }
 
 class RemoveCopyPattern : public OpRewritePattern<memref::CopyOp> {
@@ -63,12 +88,6 @@ public:
       return failure();
 
     LLVM_DEBUG(llvm::dbgs() << "match CopyOp " << copyOp << "\n");
-
-    // only support at least one alloc for now
-    if (!src.getDefiningOp<memref::AllocOp>() &&
-        !target.getDefiningOp<memref::AllocOp>()) {
-      return failure();
-    }
 
     auto allocUseInTerminator = [](memref::AllocOp alloc) {
       for (auto user : alloc.getResult().getUsers()) {
@@ -190,6 +209,41 @@ public:
       }
     }
 
+    if (auto &&reshapeOps = getReshapeOp(src); reshapeOps.size()) {
+      auto &&srcAllocOp = aliases[0][0].getDefiningOp<memref::AllocOp>();
+      if (auto targetDef = target.getDefiningOp()) {
+        if (isa<memref::AllocOp, memref::SubViewOp>(targetDef))
+          hoistUpOpInBlock(targetDef, domInfo);
+      }
+
+      if (!domInfo.properlyDominates(target, srcAllocOp)) {
+        LLVM_DEBUG(llvm::dbgs() << "failed at target " << target
+                                << " not dominated by " << srcAllocOp << "\n");
+        return failure();
+      }
+
+      rewriter.setInsertionPoint(srcAllocOp);
+      Value reshapeTarget = target;
+      for (size_t pos = 0; pos < reshapeOps.size(); ++pos) {
+        auto shapeOp = reshapeOps[pos];
+        if (auto collapseShapeOp = dyn_cast<memref::CollapseShapeOp>(shapeOp)) {
+          reshapeTarget = rewriter.create<memref::ExpandShapeOp>(
+              srcAllocOp.getLoc(), collapseShapeOp.getSrcType(), reshapeTarget,
+              collapseShapeOp.getReassociationIndices());
+        } else if (auto expandShapeOp =
+                       dyn_cast<memref::ExpandShapeOp>(shapeOp)) {
+          reshapeTarget = rewriter.create<memref::CollapseShapeOp>(
+              srcAllocOp.getLoc(), expandShapeOp.getSrcType(), reshapeTarget,
+              expandShapeOp.getReassociationIndices());
+        }
+      }
+      if (!anyIncompatibleUseExceptReshapeOp(srcAllocOp, target)) {
+        rewriter.replaceOp(srcAllocOp, {reshapeTarget});
+      }
+      if (!anyIncompatibleUse(src, target))
+        rewriter.replaceOp(src.getDefiningOp(), {target});
+      return success();
+    }
     return failure();
   }
 

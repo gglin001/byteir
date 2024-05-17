@@ -20,6 +20,7 @@
 #include "brt/core/common/common.h"
 #include "brt/core/common/status.h"
 #include "brt/core/framework/dtype.h"
+#include "brt/core/framework/memory_info.h"
 #include "brt/core/framework/value.h"
 #include "brt/core/ir/graph_info.h"
 #include "brt/core/ir/ir.h"
@@ -245,7 +246,9 @@ public:
 
   virtual void FinishIOBinding() = 0;
   virtual void AllocIntermediate() = 0;
-  virtual void BindArg(size_t idx, const void *) = 0;
+  virtual void
+  BindArg(size_t idx, const void *,
+          BrtOwnershipType owership = BrtOwnershipType::OwnedByExternal) = 0;
   virtual void *GetArg(size_t) = 0;
 
   // TODO: unify tensor and scalar to generic Value class
@@ -356,6 +359,10 @@ public:
     // store all buffers of weights
     std::vector<AsyncValue> weights;
 
+    // store op dependency
+    std::unordered_map<mlir::Operation *, std::vector<mlir::Operation *>>
+        dependency_graph;
+
     std::vector<IAllocator *> weight_and_ios_allocators;
 
     // each dynamic allocation request is a pair of (intermediate_index,
@@ -382,7 +389,9 @@ public:
 
   void FinishIOBinding() override;
   void AllocIntermediate() override;
-  void BindArg(size_t idx, const void *) override;
+  void BindArg(
+      size_t idx, const void *,
+      BrtOwnershipType owership = BrtOwnershipType::OwnedByExternal) override;
   void *GetArg(size_t) override;
 
   Scalar GetScalarImpl(size_t) override;

@@ -2,12 +2,15 @@ get_property(byteir_conversion_libs GLOBAL PROPERTY BYTEIR_CONVERSION_LIBS)
 set(BYTEIR_LIBS
   MLIRAceDialect
   MLIRByreDialect
+  MLIRByreSerialization
   MLIRCclDialect
   MLIRLaceDialect
+  MLIRLcclDialect
   MLIRTransformExtDialect
   MLIRCclTransformOps
   ByteIRAffinePasses
   ByteIRByrePasses
+  ByteIRGPUPasses
   ByteIRGPUPipelines
   ByteIRHostPipelines
   ByteIRLinalgPasses
@@ -42,23 +45,20 @@ set(LLVM_LINK_COMPONENTS
   )
 
 set(MHLO_LIBS
-  AllGmlStPasses
-  GmlStDialect
-  GmlStTransforms
-  MLIRGmlStUtils
   LmhloDialect
   LmhloGPUDialect
   MhloRegisterDialects
   LmhloPasses
   AllMhloPasses
-  AllThloPasses
-  DeallocationDialect
   DeallocationPasses
   MLIRBufferTransforms
   MLIRHLOGPUTransforms
   MLIRHLOAnalysis
   MLIRHLOTestAnalysis
   MhloTestAnalysis
+  StablehloRegister
+  StablehloOps
+  ChloOps
 )
 
 set(LIBS
@@ -68,7 +68,6 @@ set(LIBS
   ${BYTEIR_LIBS}
   ${MHLO_LIBS}
   ${test_libs}
-  #MLIRLoopAnalysis
   MLIRAnalysis
   MLIRDialect
   MLIROptLib

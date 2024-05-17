@@ -19,6 +19,18 @@ class TestOpsTensor(TestBase):
         self.run(model_filename="concat.onnx",
                  input_shape_dtype=input_shape_dtype)
 
+    def test_depth_to_space(self):
+        input_shape_dtype = [
+            ["X", (10, 16, 20, 20), "float32"],
+        ]
+        output_shape_dtype = [
+            ["Y", (10, 4, 40, 40), "float32"],
+        ]
+        proto = build_onnx("DepthToSpace", input_shape_dtype, output_shape_dtype, blocksize=2)
+        self.run(model_filename="depth_to_space.onnx",
+                 model_onnx_pb=proto,
+                 input_shape_dtype=input_shape_dtype)
+
     def test_shape(self):
         input_shape_dtype = [
             ["X", (3, 2, 4, 5), "float32"],
@@ -64,6 +76,24 @@ class TestOpsTensor(TestBase):
             "Y": np.array([[0, 1], [1, 2]], dtype=np.int64),
         }
         self.run(model_filename="gather_elments.onnx", model_onnx_pb=proto, input_data=input_data)
+
+    def test_scatternd(self):
+        input_shape_dtype = [
+            ["data", (4, 4, 4), "float32"],
+            ["indices", (2, 1), "int64"],
+            ["updates", (2, 4, 4), "float32"],
+        ]
+        output_shape_dtype = [
+            ["output", (4, 4, 4), "float32"],
+        ]
+        indices_tensor = onnx.helper.make_tensor(
+            "indices", onnx.TensorProto.INT64, [2, 1], np.array([[0], [2]]))
+        proto = build_onnx(
+            "ScatterND", input_shape_dtype, output_shape_dtype,
+            initializer=[indices_tensor]
+        )
+        input_shape_dtype = [input_shape_dtype[0], input_shape_dtype[2]]
+        self.run(model_filename="scatternd.onnx", model_onnx_pb=proto, input_shape_dtype=input_shape_dtype)
 
     def test_split(self):
         input_shape_dtype = [
@@ -122,6 +152,26 @@ class TestOpsTensor(TestBase):
             ["input_0", (1, 5, 5, 3), "float32"],
         ]
         self.run(model_filename="arg_min.onnx", input_shape_dtype=input_shape_dtype)
+
+    def test_onehot(self):
+        input_shape_dtype = [
+            ["X", (2, 3, 4), "int64"],
+            ["depth", (1,), "int64"],
+            ["values", (2,), "float32"],
+        ]
+        output_shape_dtype = [
+            ["Y", (2, 3, 4, 5), "float32"],
+        ]
+        depth_tensor = onnx.helper.make_tensor(
+            "depth", onnx.TensorProto.INT64, [1], np.array([5]))
+        values_tensor = onnx.helper.make_tensor(
+            "values", onnx.TensorProto.FLOAT, [2], np.array([0.0, 1.0]))
+        proto = build_onnx(
+            "OneHot", input_shape_dtype, output_shape_dtype,
+            initializer=[depth_tensor, values_tensor], axis=-1
+        )
+        input_shape_dtype = [input_shape_dtype[0]]
+        self.run(model_filename="onehot.onnx", model_onnx_pb=proto, input_shape_dtype=input_shape_dtype)
 
     def test_pad(self):
         input_shape_dtype = [

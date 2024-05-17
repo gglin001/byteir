@@ -28,8 +28,13 @@
 
 #include "brt/core/context/work_queue.h"
 
-#ifdef USE_CUDA
+#include "brt/backends/cpu/device/cpu_device_api.h"
+#include "brt/backends/cpu/device/cpu_work_queue.h"
+#include "brt/backends/cpu/providers/default/cpu_provider.h"
+
+#ifdef BRT_USE_CUDA
 #include "brt/backends/cuda/device/common/cuda_call.h"
+#include "brt/backends/cuda/device/cuda_device_api.h"
 #include "brt/backends/cuda/device/cuda_work_queue.h"
 #include "brt/backends/cuda/providers/default/cuda_provider.h"
 #include <cuda.h>
@@ -131,7 +136,8 @@ PyEnv::PyEnv() {
 class PyCustomAllocator final : public IAllocator {
 public:
   PyCustomAllocator(py::object alloc_f, py::object free_f)
-      : IAllocator(BrtMemoryInfo("PyCustom", "cuda", BrtCustomAllocator)),
+      : IAllocator(BrtMemoryInfo("PyCustom", "cuda",
+                                 brt::BrtAllocatorType::CustomAllocator)),
         alloc_f_(alloc_f), free_f_(free_f) {}
   void *Alloc(size_t size) override {
     py::gil_scoped_acquire _;
@@ -230,11 +236,15 @@ PYBIND11_MODULE(MODULE_NAME, m) {
       .def(py::init([](const std::string &device, py::object alloc_f,
                        py::object free_f) {
              auto session = std::make_shared<Session>();
-             if (device != "CUDA") {
-               throw std::runtime_error("unsupported device type " + device);
+             if (device == "CPU") {
+               // TODO Support customize cpu provider options.
+               THROW_ON_FAIL(NaiveCPUExecutionProviderFactory(session.get()));
+               THROW_ON_FAIL(CPUAllocatorFactory(session.get()));
+               session->SetExecDevice(DeviceType::CPU, /*device_id*/ 0);
+               session->AddDeviceAPI(DeviceType::CPU, GetCPUDeviceAPI());
              }
-#ifdef USE_CUDA
-             else {
+#ifdef BRT_USE_CUDA
+             else if (device == "CUDA") {
                if (!alloc_f || !free_f) {
                  THROW_ON_FAIL(
                      DefaultCUDAExecutionProviderFactory(session.get()));
@@ -242,11 +252,19 @@ PYBIND11_MODULE(MODULE_NAME, m) {
                  auto provider = std::make_unique<CUDAExecutionProvider>();
                  auto allocator =
                      std::make_unique<PyCustomAllocator>(alloc_f, free_f);
+                 int device_id;
+                 BRT_CUDA_CHECK(cudaGetDevice(&device_id));
+                 session->SetExecDevice(DeviceType::CUDA, device_id);
+                 session->AddDeviceAPI(DeviceType::CUDA, GetCUDADeviceAPI());
                  session->AddAllocator(std::move(allocator));
                  session->AddExecutionProvider(std::move(provider));
                }
              }
 #endif
+             else {
+               throw std::runtime_error("unsupported device type " + device);
+             }
+
              return session;
            }),
            py::arg("device") = "CUDA", py::arg("alloc_func") = py::none(),
@@ -262,14 +280,19 @@ PYBIND11_MODULE(MODULE_NAME, m) {
           "new_request_context",
           [](std::shared_ptr<Session> session, std::optional<size_t> stream) {
             std::unique_ptr<WorkQueue> work_queue;
-#ifdef USE_CUDA
-            if (stream.has_value()) {
-              work_queue.reset(new CUDAExternalStreamWorkQueue(
-                  reinterpret_cast<CUstream_st *>(stream.value())));
-            } else { // use cuda default stream
-              int device_id;
-              BRT_CUDA_CHECK(cudaGetDevice(&device_id));
-              work_queue.reset(new CUDAWorkQueue(device_id));
+            if (session->GetDeviceType() == DeviceType::CPU) {
+              work_queue.reset(new cpu::CPUNaiveWorkQueue());
+            }
+#ifdef BRT_USE_CUDA
+            else if (session->GetDeviceType() == DeviceType::CUDA) {
+              if (stream.has_value()) {
+                work_queue.reset(new CUDAExternalStreamWorkQueue(
+                    reinterpret_cast<CUstream_st *>(stream.value())));
+              } else { // use cuda default stream
+                int device_id;
+                BRT_CUDA_CHECK(cudaGetDevice(&device_id));
+                work_queue.reset(new CUDAWorkQueue(device_id));
+              }
             }
 #endif
             return std::make_unique<ReqeustContextWithSession>(

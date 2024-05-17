@@ -27,15 +27,19 @@
 #include "tensorflow/compiler/mlir/tensorflow/ir/tf_executor.h"
 
 #include "tf_mlir_ext/transforms/constant_folding.h"
+#include "tf_mlir_ext/transforms/convert_repeat_to_tile.h"
 #include "tf_mlir_ext/transforms/fuse_tf_ops.h"
 #include "tf_mlir_ext/transforms/mhlo_legalize_tf_ext.h"
 #include "tf_mlir_ext/transforms/process_dynamic_stitch_as_static.h"
 #include "tf_mlir_ext/transforms/remove_control_flow.h"
+#include "tf_mlir_ext/transforms/remove_cstr_reshapable.h"
 #include "tf_mlir_ext/transforms/reshape_movedown_string.h"
 #include "tf_mlir_ext/transforms/rewrite_func_attr_to_byteir.h"
 #include "tf_mlir_ext/transforms/rewrite_to_custom_call.h"
 #include "tf_mlir_ext/transforms/rewrite_to_if.h"
+#include "tf_mlir_ext/transforms/set_repeat_out_batch_size.h"
 #include "tf_mlir_ext/transforms/tf_fallback_to_custom_call.h"
+#include "tf_mlir_ext/transforms/tf_switch_merge_to_if.h"
 
 namespace mlir {
 

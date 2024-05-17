@@ -17,11 +17,14 @@
 #include "byteir/Dialect/Affine/Passes.h"
 #include "byteir/Dialect/Byre/ByreDialect.h"
 #include "byteir/Dialect/Byre/Passes.h"
+#include "byteir/Dialect/Byre/Serialization/ByreSerialOps.h"
 #include "byteir/Dialect/Cat/IR/CatDialect.h"
 #include "byteir/Dialect/Ccl/IR/CclOps.h"
 #include "byteir/Dialect/Ccl/Passes.h"
 #include "byteir/Dialect/Ccl/TransformOps/CclTransformOps.h"
+#include "byteir/Dialect/GPU/Passes.h"
 #include "byteir/Dialect/Lace/LaceDialect.h"
+#include "byteir/Dialect/Lccl/LcclOps.h"
 #include "byteir/Dialect/Linalg/IR/LinalgExtOps.h"
 #include "byteir/Dialect/Linalg/Passes.h"
 #include "byteir/Dialect/Linalg/TransformOps/LinalgExtTransformOps.h"
@@ -30,6 +33,7 @@
 #include "byteir/Dialect/Shape/IR/ShapeExtOps.h"
 #include "byteir/Dialect/Shape/Passes.h"
 #include "byteir/Dialect/Tensor/IR/TilingInterfaceImpl.h"
+#include "byteir/Dialect/Tensor/Passes.h"
 #include "byteir/Dialect/Transform/IR/TransformExtOps.h"
 #include "byteir/Dialect/Transform/Passes.h"
 #include "byteir/Dialect/Vector/Transforms/Passes.h"
@@ -37,9 +41,6 @@
 #include "byteir/Pipelines/InitAllPipelines.h"
 #include "byteir/Transforms/Passes.h"
 #include "byteir/Utils/OpInterfaceUtils.h"
-#include "gml_st/IR/gml_st_ops.h"
-#include "gml_st/transforms/passes.h"
-#include "gml_st/transforms/test_passes.h"
 #include "lhlo/IR/lhlo_ops.h"
 #include "lhlo/transforms/passes.h"
 #include "lhlo_gpu/IR/lhlo_gpu_ops.h"
@@ -57,8 +58,6 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "stablehlo/dialect/Register.h"
-#include "thlo/IR/thlo_ops.h"
-#include "thlo/transforms/passes.h"
 #include "transforms/gpu_passes.h"
 #include "transforms/passes.h"
 #include "llvm/Support/CommandLine.h"
@@ -71,7 +70,7 @@ using namespace mlir;
 
 namespace byteir {
 namespace test {
-void registerTestMhloCanonicalizeExtPass();
+void registerTestByreSerialRoundtripPass();
 void registerTestConvertFuncToCustomCallPass();
 void registerTestConvertInsertionPass();
 void registerTestCustomConvertPass();
@@ -90,7 +89,7 @@ void registerTestMergeTwoModulesPass();
 
 #ifdef BYTEIR_INCLUDE_TESTS
 void registerTestPasses() {
-  byteir::test::registerTestMhloCanonicalizeExtPass();
+  byteir::test::registerTestByreSerialRoundtripPass();
   byteir::test::registerTestConvertFuncToCustomCallPass();
   byteir::test::registerTestConvertInsertionPass();
   byteir::test::registerTestCustomConvertPass();
@@ -113,9 +112,6 @@ int main(int argc, char **argv) {
   mlir::registerLMHLOGPUTransformsPasses();
   mlir::mhlo::registerAllMhloPasses();
   mlir::lmhlo::registerAllLmhloPasses();
-  mlir::thlo::registerAllThloPasses();
-  mlir::gml_st::registerGmlStPasses();
-  mlir::gml_st::registerGmlStTestPasses();
 
   registerByteIRConversionPasses();
   registerByteIRTransformsPasses();
@@ -123,11 +119,13 @@ int main(int argc, char **argv) {
   registerByteIRAffinePasses();
   registerByteIRByrePasses();
   registerByteIRCclPasses();
+  registerByteIRGPUPasses();
   registerByteIRLinalgPasses();
   registerByteIRMemRefPasses();
   registerByteIRMhloPassesExt();
   registerByteIRSCFPasses();
   registerByteIRShapePasses();
+  registerByteIRTensorPasses();
   registerByteIRTransformPasses();
   registerByteIRVectorPasses();
 
@@ -145,12 +143,15 @@ int main(int argc, char **argv) {
   registeOpInterfaceExtensions(registry);
 
   // register ByteIR's dialects here
+  mlir::stablehlo::registerAllDialects(registry);
   registry.insert<mlir::ace::AceDialect>();
   registry.insert<mlir::byre::ByreDialect>();
+  registry.insert<mlir::byre::serialization::ByreSerialDialect>();
   registry.insert<mlir::ccl::CclDialect>();
   registry.insert<mlir::cat::CatDialect>();
   registry.insert<mlir::mhlo::MhloDialect>();
   registry.insert<mlir::lace::LaceDialect>();
+  registry.insert<mlir::lccl::LcclDialect>();
   registry.insert<mlir::lmhlo::LmhloDialect>();
   registry.insert<mlir::shape_ext::ShapeExtDialect>();
   registry.insert<mlir::linalg_ext::LinalgExtDialect>();

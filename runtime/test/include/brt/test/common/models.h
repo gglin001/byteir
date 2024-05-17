@@ -105,6 +105,10 @@ const void *CreateReduction(brt::ir::ByREBuilder &byre_builder,
                             std::vector<int64_t> dimensions,
                             std::string reduce_op);
 
+const void *CreateTopK(brt::ir::ByREBuilder &byre_builder, DTypeEnum dataType,
+                       DTypeEnum indexType, std::vector<int64_t> src_shape,
+                       int64_t k, std::vector<int64_t> axis_vec, bool sorted);
+
 const void *CreateTranspose(brt::ir::ByREBuilder &byre_builder,
                             DTypeEnum dataType, const std::string &space,
                             std::vector<int64_t> &shape_input,
@@ -121,12 +125,26 @@ const void *CreateAliasThenIndexPut(brt::ir::ByREBuilder &byre_builder,
                                     int64_t idx_src_len, int64_t idx_dst_len,
                                     int32_t idx_offset);
 
+const void *CreateRepeat(brt::ir::ByREBuilder &byre_builder, DTypeEnum dataType,
+                         DTypeEnum timesType, std::vector<int64_t> data_shape,
+                         std::vector<int64_t> times_shape,
+                         std::vector<int64_t> output_shape);
+
 // always cuda
 const void *CreatePTXAddOp(brt::ir::ByREBuilder &byre_builder);
 
 const void *CreateTFWhereOp(brt::ir::ByREBuilder &byre_builder,
                             DTypeEnum input_dtype,
                             const std::vector<int64_t> &shape);
+
+const void *CreateTFSelectOp(brt::ir::ByREBuilder &byre_builder,
+                             DTypeEnum dtype,
+                             const std::vector<int64_t> &cond_shape,
+                             const std::vector<int64_t> &input_shape);
+
+const void *CreateTFStringToNumberOp(brt::ir::ByREBuilder &byre_builder,
+                                     DTypeEnum InType, DTypeEnum OutType,
+                                     const std::vector<int64_t> &input_shape);
 
 const void *
 CreateWithEntryAttrs(brt::ir::ByREBuilder &byre_builder, DTypeEnum input_dtype,

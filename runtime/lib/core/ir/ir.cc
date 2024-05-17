@@ -21,6 +21,8 @@
 #include "brt/core/ir/util.h"
 #include "byteir/Dialect/Ace/AceDialect.h" // include ace.string
 #include "byteir/Dialect/Byre/ByreDialect.h"
+#include "byteir/Dialect/Byre/Serialization.h"
+#include "byteir/Dialect/Byre/Serialization/ByreSerialOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/AsmState.h"
@@ -41,6 +43,7 @@ using namespace brt::ir;
 using namespace llvm;
 using namespace mlir;
 using namespace mlir::byre;
+using namespace mlir::byre::serialization;
 
 namespace brt {
 namespace ir {
@@ -95,7 +98,9 @@ struct ByREHandleImpl {
 static common::Status InitializeMLIR(ByREHandleImpl &impl) {
   // register ByteIR's dialects here
   impl.registry.insert<mlir::func::FuncDialect, mlir::memref::MemRefDialect,
-                       mlir::byre::ByreDialect, mlir::ace::AceDialect>();
+                       mlir::byre::ByreDialect,
+                       mlir::byre::serialization::ByreSerialDialect,
+                       mlir::ace::AceDialect>();
 
   // create mlir_context
   impl.mlir_ctx_ptr =
@@ -138,9 +143,25 @@ common::Status ByREHandle::Load(const std::string &url,
 
   llvm::SourceMgr sourceMgr;
   sourceMgr.AddNewSourceBuffer(std::move(file), llvm::SMLoc());
+  auto ctx = impl_->mlir_ctx_ptr.get();
   // get OwningModuleRef
-  impl_->module_ref =
-      parseSourceFile<ModuleOp>(sourceMgr, impl_->mlir_ctx_ptr.get());
+  if (!isBytecode(*sourceMgr.getMemoryBuffer(sourceMgr.getMainFileID()))) {
+    impl_->module_ref = parseSourceFile<ModuleOp>(sourceMgr, ctx);
+  } else {
+    ctx->loadDialect<mlir::func::FuncDialect, mlir::memref::MemRefDialect,
+                     mlir::byre::ByreDialect,
+                     mlir::byre::serialization::ByreSerialDialect,
+                     mlir::ace::AceDialect>();
+    OwningOpRef<Operation *> parsedModule = parseSourceFile(sourceMgr, ctx);
+    if (!parsedModule) {
+      return Status(BRT, FAIL, "failed to parse module bytecode file");
+    }
+
+    impl_->module_ref = convertFromSerializableByre(*parsedModule);
+    if (!impl_->module_ref) {
+      return Status(BRT, FAIL, "failed to convert byre serial to byre");
+    }
+  }
   return Status::OK();
 }
 
@@ -188,7 +209,8 @@ common::Status ByREHandle::IterateNode(
 }
 
 common::Status ByREHandle::IterateEntryFuncArg(
-    std::function<common::Status(mlir::BlockArgument)> func) {
+    std::function<common::Status(mlir::BlockArgument, mlir::DictionaryAttr)>
+        func) {
   // iterate all entry function ops in this module.
   for (auto entry : impl_->module_ref->getOps<func::FuncOp>()) {
 
@@ -198,8 +220,10 @@ common::Status ByREHandle::IterateEntryFuncArg(
     }
 
     // TODO how to handle multiple entry function vs multiple model
+    int idx = 0;
     for (auto block_arg : entry.getArguments()) {
-      auto status_result = func(block_arg);
+      mlir::DictionaryAttr arg_attrs = entry.getArgAttrDict(idx++);
+      auto status_result = func(block_arg, arg_attrs);
       if (!status_result.IsOK()) {
         return status_result;
       }

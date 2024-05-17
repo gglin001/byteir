@@ -30,6 +30,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Shape/IR/Shape.h"
+#include "mlir/Dialect/Shape/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
@@ -54,14 +55,19 @@ struct CustomizedTfToMhloPipelinePass
     : public CustomizedTfToMhloPipelineBase<CustomizedTfToMhloPipelinePass> {
   CustomizedTfToMhloPipelinePass(
       const std::vector<std::string> &customcall_ops, bool remove_control_flow,
-      bool staticalize_dynamic_shape, bool stop_after_rewrite_custom_call,
+      bool staticalize_dynamic_shape, bool stop_after_convert_to_tf_dialect,
+      bool stop_after_rewrite_custom_call,
       const std::unordered_map<std::string, Attribute>
-          &additional_main_func_attrs) {
+          &additional_main_func_attrs,
+      bool set_assuming_to_be_true, int64_t repeat_out_batch_size) {
     this->customCallOps = customcall_ops;
     this->removeControlFlow = remove_control_flow;
     this->staticalizeDynamicShape = staticalize_dynamic_shape;
+    this->stopAfterConvertToTfDialect = stop_after_convert_to_tf_dialect;
     this->stopAfterRewriteCustomCall = stop_after_rewrite_custom_call;
     this->additional_main_func_attrs = additional_main_func_attrs;
+    this->setAssumingToBeTrue = set_assuming_to_be_true;
+    this->repeatOutBatchSize = repeat_out_batch_size;
   }
 
   void runOnOperation() override {
@@ -72,15 +78,13 @@ struct CustomizedTfToMhloPipelinePass
     pm.addPass(mlir::createSCCPPass());
     pm.addPass(mlir::createCanonicalizerPass());
 
-    // not safe remove-control-flow pass
-    if (removeControlFlow)
+    // prun useless tf node
+    pm.addNestedPass<mlir::func::FuncOp>(
+        mlir::tf_executor::CreateTFExecutorGraphPruningPass());
+    if (removeControlFlow) {
       pm.addNestedPass<mlir::func::FuncOp>(
-          mlir::tfext::createRemoveControlFlowPass());
-
-    // Note that the region-based control-flow produced here still contains
-    // function call ops which get inlined by the subsequent inliner pass.
-    pm.addPass(mlir::TF::CreateTFFunctionalControlFlowToRegions());
-
+          mlir::tfext::createTFSwitchMergeToIfPass());
+    }
     // prun useless tf node
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::tf_executor::CreateTFExecutorGraphPruningPass());
@@ -114,21 +118,38 @@ struct CustomizedTfToMhloPipelinePass
     pm.addPass(mlir::TF::CreatePromoteResourcesToArgsPass());
     pm.addPass(mlir::createSymbolDCEPass());
     pm.addPass(mlir::TF::CreateTFShapeInferencePass());
-    // TODO(b/171426148): We cannot completely remove region to functional
-    // control flow conversion from this pipeline yet as it causes some unit
-    // tests to fail.
+    //// TODO(b/171426148): We cannot completely remove region to functional
+    //// control flow conversion from this pipeline yet as it causes some unit
+    //// tests to fail.
     pm.addPass(mlir::TF::CreateTFRegionControlFlowToFunctional());
-    // LegalizeTFControlFlow encapsulates arguments for control flow operations
-    // with a tuple argument which break the assumption of resource lifting
-    // inside PromoteResourcesToArgs.
+    //  LegalizeTFControlFlow encapsulates arguments for control flow operations
+    //  with a tuple argument which break the assumption of resource lifting
+    //  inside PromoteResourcesToArgs.
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::CreateExecutorDialectToFunctionalConversionPass());
+    if (this->stopAfterConvertToTfDialect) {
+      pm.addNestedPass<mlir::func::FuncOp>(
+          mlir::tfext::createRewriteFuncAttrToByteIRPass(
+              additional_main_func_attrs));
+
+      if (mlir::failed(runPipeline(pm, m))) {
+        signalPassFailure();
+      }
+      return;
+    }
+
     if (staticalizeDynamicShape) {
       pm.addNestedPass<mlir::func::FuncOp>(
           mlir::tfext::createProcessDynamicStitchAsStaticPass());
     }
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::tfext::createReshapeMovedownStringPass());
+    pm.addNestedPass<mlir::func::FuncOp>(
+        mlir::tfext::createConvertRepeatToTilePass());
+    if (repeatOutBatchSize > 0) {
+      pm.addNestedPass<mlir::func::FuncOp>(
+          mlir::tfext::createSetRepeatOutBatchSizePass(repeatOutBatchSize));
+    }
 
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::tfext::createConstantFoldingPass());
@@ -137,16 +158,22 @@ struct CustomizedTfToMhloPipelinePass
     pm.addPass(mlir::TF::CreateTFShapeInferencePass());
 
     pm.addNestedPass<mlir::func::FuncOp>(mlir::TF::CreateLowerQuantizedPass());
-    pm.addPass(mlir::mhlo::CreateLegalizeTfTypesPass());
 
     // fuse dilated conv
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::TFL::CreateIdentifyDilatedConvPass());
     pm.addNestedPass<mlir::func::FuncOp>(mlir::tfext::createFuseTFOpsPass());
 
-    pm.addPass(mlir::tfext::createRewriteToCustomCallOpsPass(customCallOps));
+    pm.addPass(
+        mlir::tfext::createRewriteToCustomCallOpsPass(customCallOps,
+                                                      /*keepBody*/ false));
 
     if (this->stopAfterRewriteCustomCall) {
+      pm.addPass(mlir::TF::CreateTFShapeInferencePass());
+      pm.addNestedPass<mlir::func::FuncOp>(
+          mlir::tfext::createRewriteFuncAttrToByteIRPass(
+              additional_main_func_attrs));
+
       if (mlir::failed(runPipeline(pm, m))) {
         signalPassFailure();
       }
@@ -170,7 +197,9 @@ struct CustomizedTfToMhloPipelinePass
     // expose more graph pruning and canonicalization opportunities that are
     // necessary for the second LegalizeTFPass(allow_partial_conversion=false)
     // invocation.
-    pm.addPass(mlir::tfext::createRewriteToCustomCallOpsPass(customCallOps));
+    pm.addPass(
+        mlir::tfext::createRewriteToCustomCallOpsPass(customCallOps,
+                                                      /*keepBody*/ false));
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::tfext::createMhloLegalizeTfExtPass());
     pm.addPass(mlir::mhlo::createLegalizeTFPass(
@@ -191,7 +220,9 @@ struct CustomizedTfToMhloPipelinePass
     pm.addPass(mlir::createSCCPPass());
     pm.addPass(mlir::createCanonicalizerPass());
 
-    pm.addPass(mlir::tfext::createRewriteToCustomCallOpsPass(customCallOps));
+    pm.addPass(
+        mlir::tfext::createRewriteToCustomCallOpsPass(customCallOps,
+                                                      /*keepBody*/ false));
     pm.addNestedPass<mlir::func::FuncOp>(
         mlir::tfext::createMhloLegalizeTfExtPass());
     pm.addPass(mlir::mhlo::createLegalizeTFPass(
@@ -210,7 +241,15 @@ struct CustomizedTfToMhloPipelinePass
         mlir::tfext::createRewriteFuncAttrToByteIRPass(
             additional_main_func_attrs));
 
+    if (setAssumingToBeTrue) {
+      pm.addNestedPass<mlir::func::FuncOp>(
+          mlir::createRemoveShapeConstraintsPass());
+      pm.addNestedPass<mlir::func::FuncOp>(
+          mlir::tfext::createRemoveCstrReshapablePass());
+    }
     pm.addPass(mlir::createCanonicalizerPass());
+
+    pm.addPass(mlir::mhlo::createHloLegalizeToStablehloPass());
 
     if (mlir::failed(runPipeline(pm, m))) {
       signalPassFailure();
@@ -227,10 +266,15 @@ mlir::tfext::createCustomizedTfToMhloPipelinePass(
     const std::vector<std::string> &customcall_ops /*= {}*/,
     bool remove_control_flow /*= false*/,
     bool staticalize_dynamic_shape /*= false*/,
+    bool stop_after_convert_to_tf_dialect /*= false*/,
     bool stop_after_rewrite_custom_call /*= false*/,
     const std::unordered_map<std::string, Attribute>
-        &additional_main_func_attrs /*= {}*/) {
+        &additional_main_func_attrs /*= {}*/,
+    bool set_assuming_to_be_true /*= true*/,
+    int64_t repeat_out_batch_size /*= -1*/) {
   return std::make_unique<CustomizedTfToMhloPipelinePass>(
       customcall_ops, remove_control_flow, staticalize_dynamic_shape,
-      stop_after_rewrite_custom_call, additional_main_func_attrs);
+      stop_after_convert_to_tf_dialect, stop_after_rewrite_custom_call,
+      additional_main_func_attrs, set_assuming_to_be_true,
+      repeat_out_batch_size);
 }

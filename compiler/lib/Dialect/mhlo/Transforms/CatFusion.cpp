@@ -53,7 +53,9 @@ bool isFusibleCandidate(Operation *op) {
     return true;
   if (isa<mhlo::TransposeOp>(op)) {
     auto transOp = cast<mhlo::TransposeOp>(*op);
-    if (matchPermute(transOp, {0, 2, 1}) || matchPermute(transOp, {0, 2, 1, 3}))
+    if (!matchPermute(transOp, {0, 2, 3, 1}) &&
+        !matchPermute(transOp, {0, 3, 1, 2}) && !matchPermute(transOp, {1, 0}))
+      // BRT support TBD, offload to AIT
       return true;
   }
   return false;
@@ -67,12 +69,16 @@ bool isFusibleWith(Operation *target, Operation * /*start*/) { return true; }
 
 bool isValidSingleOp(Operation *op) { return true; }
 
+bool isValidFusionPattern(const MhloFusionPattern &) { return true; }
+
 bool isFusibleCandidateAggressive(Operation *op) {
   if (isa<cat::CatOpInterface>(op))
     return true;
   if (isa<mhlo::TransposeOp>(op)) {
     auto transOp = cast<mhlo::TransposeOp>(*op);
-    if (matchPermute(transOp, {0, 2, 1}) || matchPermute(transOp, {0, 2, 1, 3}))
+    if (!matchPermute(transOp, {0, 2, 3, 1}) &&
+        !matchPermute(transOp, {0, 3, 1, 2}) && !matchPermute(transOp, {1, 0}))
+      // BRT support TBD, offload to AIT
       return true;
   }
   if (isa<mhlo::ReshapeOp>(op))
@@ -99,14 +105,16 @@ bool isValidSingleOpAggressive(Operation *op) {
 }
 
 static GenericFuserConfig config{
-    getByteIRCatFusionAttrName(), cat_fusion::isFusibleCandidate,
-    cat_fusion::isFusibleStart,   cat_fusion::isFusibleTrigger,
-    cat_fusion::isFusibleWith,    cat_fusion::isValidSingleOp};
+    getByteIRCatFusionAttrName(),    cat_fusion::isFusibleCandidate,
+    cat_fusion::isFusibleStart,      cat_fusion::isFusibleTrigger,
+    cat_fusion::isFusibleWith,       cat_fusion::isValidSingleOp,
+    cat_fusion::isValidFusionPattern};
 
 static GenericFuserConfig aggressiveConfig{
-    getByteIRCatFusionAttrName(), cat_fusion::isFusibleCandidateAggressive,
-    cat_fusion::isFusibleStart,   cat_fusion::isFusibleTrigger,
-    cat_fusion::isFusibleWith,    cat_fusion::isValidSingleOpAggressive};
+    getByteIRCatFusionAttrName(),    cat_fusion::isFusibleCandidateAggressive,
+    cat_fusion::isFusibleStart,      cat_fusion::isFusibleTrigger,
+    cat_fusion::isFusibleWith,       cat_fusion::isValidSingleOpAggressive,
+    cat_fusion::isValidFusionPattern};
 
 } // namespace cat_fusion
 

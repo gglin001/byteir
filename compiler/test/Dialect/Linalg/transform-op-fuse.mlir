@@ -75,7 +75,7 @@ transform.sequence failures(propagate) {
   %0 = transform.structured.match ops{["linalg.elemwise_binary"]} in %arg1 : (!pdl.operation) -> !pdl.operation
   %1, %loops:2 = transform.structured.fuse_ext %0 {tile_sizes = [32, 32], tile_interchange = [0, 1]}
   %loop = transform.cast %loops#0 : !pdl.operation to !transform.op<"scf.for">
-  transform.loop.peel %loop : (!transform.op<"scf.for">) -> !pdl.operation
+  transform.loop.peel %loop : (!transform.op<"scf.for">) -> (!pdl.operation, !pdl.operation)
 }
 
 // -----
@@ -148,7 +148,7 @@ transform.sequence failures(propagate) {
   %0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!pdl.operation) -> !pdl.operation
   %1, %loops:2 = transform.structured.fuse %0 {tile_sizes = [5, 0, 7], tile_interchange = [0, 2, 1]} :
     (!pdl.operation) -> (!pdl.operation, !pdl.operation, !pdl.operation)
-  %2, %loops_2 = transform.structured.tile %1 [0, 4] : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
+  %2, %loops_2 = transform.structured.tile_using_for %1 [0, 4] : (!pdl.operation) -> (!pdl.operation, !pdl.operation)
 }
 
 // -----
@@ -406,6 +406,50 @@ transform.sequence failures(propagate) {
 
 // -----
 
+
+// CHECK-LABEL: func.func @fuse_softmax_matmul_broadcast_elementwise
+func.func @fuse_softmax_matmul_broadcast_elementwise(%arg0: tensor<1024x32xf32>, %arg1: tensor<32x64xf32>) -> tensor<1024x64xf32> {
+  //     CHECK-DAG: linalg.fill
+  //     CHECK-DAG: linalg.fill
+  //     CHECK:     scf.for
+  //     CHECK:       linalg_ext.softmax
+  //     CHECK:       linalg_ext.diag
+  //     CHECK:       linalg.matmul
+  //     CHECK:       linalg.matmul
+  //     CHECK:     }
+  //     CHECK:     linalg.broadcast
+  //     CHECK:     linalg.elemwise_binary
+  %0 = tensor.empty() : tensor<1024x64xf32>
+  %2 = tensor.empty() : tensor<1024x32xf32>
+  %3 = tensor.empty() : tensor<1024xf32>
+  %4 = tensor.empty() : tensor<1024xf32>
+  %5 = tensor.empty() : tensor<1024xf32>
+  %t1 = tensor.empty() : tensor<1024x1024xf32>
+  %cst = arith.constant 0xFF800000 : f32
+  %fill_3 = linalg.fill ins(%cst : f32) outs(%3 : tensor<1024xf32>) -> tensor<1024xf32>
+  %cst_0 = arith.constant 0.0 : f32
+  %fill_4 = linalg.fill ins(%cst_0 : f32) outs(%4 : tensor<1024xf32>) -> tensor<1024xf32>
+  %6:4 = linalg_ext.softmax
+    dimension(1)
+    ins(%arg0 : tensor<1024x32xf32>) outs(%2, %fill_3, %fill_4, %5 : tensor<1024x32xf32>, tensor<1024xf32>, tensor<1024xf32>, tensor<1024xf32>) : tensor<1024x32xf32>, tensor<1024xf32>, tensor<1024xf32>, tensor<1024xf32>
+  %7 = linalg.matmul {__root__} ins(%6#0, %arg1: tensor<1024x32xf32>, tensor<32x64xf32>)
+                     outs(%0: tensor<1024x64xf32>)
+    -> tensor<1024x64xf32>
+  %broadcasted = linalg.broadcast ins(%6#2 : tensor<1024xf32>) outs(%0 : tensor<1024x64xf32>) dimensions = [1]
+  %8 = linalg.elemwise_binary ins(%7, %broadcasted : tensor<1024x64xf32>, tensor<1024x64xf32>)
+                              outs(%0: tensor<1024x64xf32>) -> tensor<1024x64xf32>
+  return %8 : tensor<1024x64xf32>
+}
+
+transform.sequence failures(propagate) {
+^bb1(%arg1: !pdl.operation):
+  %0 = transform.structured.match attributes {__root__} in %arg1 : (!pdl.operation) -> !pdl.operation
+  %1, %loop = transform.structured.fuse_ext %0 {tile_sizes = [0, 0, 4], tile_interchange = [0, 1, 2]}
+  transform.structured.tile_loop_hint %1 : !pdl.operation
+}
+
+// -----
+
 // CHECK-LABEL: func.func @fuse_matmul_matmul
 func.func @fuse_matmul_matmul(%arg0: tensor<1024x32xf32>, %arg1: tensor<32x512xf32>, %arg2: tensor<512x32xf32>) -> tensor<1024x32xf32> {
 // CHECK: scf.for
@@ -629,14 +673,14 @@ func.func @max_pool_generic(%arg0: tensor<4x126x126x16xf32>) -> tensor<4x63x63x1
 // CHECK: scf.for
 // CHECK:   linalg.generic
 // CHEKC-SAME: iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction", "reduction"]
-// CHECK:     arith.maxf
+// CHECK:     arith.maxnumf
 // CHECK:     linalg.yield
 // CHECK: scf.yield
   %cst = arith.constant dense<0xFC00> : tensor<4x63x63x16xf32>
   %0 = tensor.empty() : tensor<2x2xf32>
   %1 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction", "reduction"]} ins(%arg0, %0 : tensor<4x126x126x16xf32>, tensor<2x2xf32>) outs(%cst : tensor<4x63x63x16xf32>) attrs =  {__root__} {
   ^bb0(%in: f32, %in_0: f32, %out: f32):
-    %5 = arith.maxf %out, %in : f32
+    %5 = arith.maxnumf %out, %in : f32
     linalg.yield %5 : f32
   } -> tensor<4x63x63x16xf32>
   return %1 : tensor<4x63x63x16xf32>
@@ -1136,7 +1180,6 @@ func.func @elew_pad_elew(%arg0: tensor<12x12xf32>) -> tensor<14x14xf32> {
   %3 = linalg.elemwise_unary {__root__} ins(%padded : tensor<14x14xf32>) outs(%2 : tensor<14x14xf32>) -> tensor<14x14xf32>
   return %3 : tensor<14x14xf32>
 }
-
 // CHECK-LABEL: func.func @elew_pad_elew
 // CHECK: scf.for
 // CHECK:   scf.for
@@ -1150,3 +1193,37 @@ func.func @elew_pad_elew(%arg0: tensor<12x12xf32>) -> tensor<14x14xf32> {
 // CHECK:     scf.yield
 // CHECK:   scf.yield
 
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+func.func @multi_results_one_in_tile_fuse_path_one_in_terminator(%arg0: tensor<1024xf32>, %arg1: tensor<1024xf32>, %arg2: tensor<1024xf32>) -> (tensor<1024xf32>, tensor<1024xf32>) {
+  // CHECK-LABEL: func.func @multi_results_one_in_tile_fuse_path_one_in_terminator
+  // CHECK: %[[E0:.*]] = tensor.empty() : tensor<1024xf32>
+  // CHECK: scf.for {{.*}} iter_args(%[[ARG0:.*]] = %[[E0]], %[[ARG1:.*]] = %[[E0]])
+  // CHECK:     %[[V0:.*]]:2 = linalg.generic{{.*}}__g0__
+  // CHECK:     %[[V1:.*]] = linalg.generic{{.*}}__g1__
+  // CHECK-DAG: %[[INS0:.*]] = tensor.insert_slice %[[V1]] into %[[ARG0]]
+  // CHECK-DAG: %[[INS1:.*]] = tensor.insert_slice %[[V0]]#1 into %[[ARG1]]
+  // CHECK:     scf.yield %[[INS0]], %[[INS1]]
+  %0 = tensor.empty() : tensor<1024xf32>
+  %1:2 = linalg.generic {__g0__, indexing_maps = [#map, #map, #map, #map], iterator_types = ["parallel"]} ins(%arg0, %arg1 : tensor<1024xf32>, tensor<1024xf32>) outs(%0, %0 : tensor<1024xf32>, tensor<1024xf32>) {
+  ^bb0(%in_0: f32, %in_1: f32, %out_0: f32, %out_1: f32):
+    %2 = arith.addf %in_0, %in_1 : f32
+    %3 = arith.subf %in_0, %in_1 : f32
+    linalg.yield %2, %3 : f32, f32
+  } -> (tensor<1024xf32>, tensor<1024xf32>)
+  %2 = linalg.generic {__root__, __g1__, indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]} ins(%arg2, %1#0 : tensor<1024xf32>, tensor<1024xf32>) outs(%0 : tensor<1024xf32>) {
+  ^bb0(%in_0: f32, %in_1: f32, %out : f32):
+    %2 = arith.addf %in_0, %in_1 : f32
+    linalg.yield %2 : f32
+  } -> tensor<1024xf32>
+  return %1#1, %2 : tensor<1024xf32>, tensor<1024xf32>
+}
+
+transform.sequence  failures(propagate) {
+^bb0(%arg0: !pdl.operation):
+  %0 = transform.structured.match attributes {__root__} in %arg0 : (!pdl.operation) -> !pdl.operation
+  %transformed, %loops = transform.structured.fuse_ext %0 {tile_interchange = [], tile_sizes = [1]}
+  cleanup
+}

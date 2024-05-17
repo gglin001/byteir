@@ -64,48 +64,87 @@ namespace {
 /// dimensions. It only applies these to "parallel" loops without mixing them
 /// with "reduction" types.
 static SmallVector<ReassociationIndices>
-getCollapsibleLoops(linalg::GenericOp genericOp) {
+getCollapsibleLoops(linalg::GenericOp genericOp,
+                    utils::IteratorType iteratorType) {
   SmallVector<ReassociationIndices> contiguousLoops;
 
   SmallVector<unsigned> pDims;
-  genericOp.getParallelDims(pDims);
+  findPositionsOfType(genericOp.getIteratorTypesArray(), iteratorType, pDims);
   if (pDims.size() < 2)
     return contiguousLoops;
 
   llvm::SmallDenseSet<unsigned> pLoops(pDims.begin(), pDims.end());
 
+  // There is no mechanism to tell the collapsed indexes to
+  // `tensor.expand_shape`. We only can collapse partial loops
+  // that contain at most one dynamic dims.
   auto hasAllMapsSameSequence = [&](AffineExpr preExpr, AffineExpr nextExpr) {
     for (AffineMap map : genericOp.getIndexingMapsArray()) {
-      bool foundSeq = false;
-      for (auto [index, resultExpr] : llvm::enumerate(map.getResults())) {
-        if (resultExpr == nextExpr) {
-          foundSeq = (index > 0 && preExpr == map.getResult(index - 1));
-          break;
-        }
+      auto prePos = map.getResultPosition(preExpr);
+      auto nextPos = map.getResultPosition(nextExpr);
+      if (!prePos.has_value()) {
+        if (nextPos.has_value())
+          return false;
+      } else {
+        if (!nextPos.has_value())
+          return false;
+
+        if (prePos.value() != nextPos.value() + 1)
+          return false;
       }
-      if (!foundSeq)
-        return false;
     }
     return true;
   };
 
+  auto hasMultipleDynamicDims =
+      [&](const SmallVector<AffineExpr, 4> &exprOfRange) {
+        for (auto [index, map] :
+             llvm::enumerate(genericOp.getIndexingMapsArray())) {
+          auto operandType = genericOp->getOperand(index)
+                                 .getType()
+                                 .template dyn_cast<ShapedType>();
+          if (operandType) {
+            int64_t dynamicDimCount = 0;
+            for (auto expr : exprOfRange) {
+              auto pos = map.getResultPosition(expr);
+              if (pos.has_value() &&
+                  operandType.getShape()[pos.value()] == ShapedType::kDynamic) {
+                dynamicDimCount += 1;
+              }
+            }
+            if (dynamicDimCount > 1)
+              return false;
+          }
+        }
+        return true;
+      };
+
   ReassociationIndices range;
   AffineExpr preExpr;
-  for (auto nextExpr : genericOp.getIndexingMapsArray().front().getResults()) {
+  SmallVector<AffineExpr, 4> exprOfRange;
+  // collapse loop greedily from the inside out
+  for (auto nextExpr :
+       llvm::reverse(genericOp.getIndexingMapsArray().front().getResults())) {
     unsigned pos = nextExpr.cast<AffineDimExpr>().getPosition();
     if (!range.empty()) {
-      if (!hasAllMapsSameSequence(preExpr, nextExpr) || !pLoops.count(pos)) {
+      auto exprOfRangeWithNext = exprOfRange;
+      exprOfRangeWithNext.push_back(nextExpr);
+      if (!hasAllMapsSameSequence(preExpr, nextExpr) || !pLoops.count(pos) ||
+          !hasMultipleDynamicDims(exprOfRangeWithNext)) {
         if (range.size() > 1)
-          contiguousLoops.push_back({range.begin(), range.end()});
+          contiguousLoops.push_back({range.rbegin(), range.rend()});
         range.clear();
+        exprOfRange.clear();
       }
     }
     preExpr = nextExpr;
-    if (pLoops.count(pos))
+    if (pLoops.count(pos)) {
       range.push_back(pos);
+      exprOfRange.push_back(nextExpr);
+    }
   }
   if (range.size() > 1)
-    contiguousLoops.push_back(range);
+    contiguousLoops.push_back({range.rbegin(), range.rend()});
 
   LLVM_DEBUG({
     llvm::dbgs() << "Collapsing dimensions if possible: ";
@@ -123,11 +162,6 @@ getCollapsibleLoops(linalg::GenericOp genericOp) {
 
 /// Returns true if the given op is collapsable.
 static bool isEligibleForCollapse(linalg::GenericOp genericOp) {
-  // TODO(guray) There is no mechanism to tell the collapsed indexes to
-  // `tensor.expand_shape`. Once we have this support in MLIR, we can enable
-  // dynamic tensor shapes.
-  if (genericOp.hasDynamicShape())
-    return false;
 
   // TODO(guray) Currently we can only collapse when result of all the
   // AffineMaps are dimensions. Possible to collapse cases like
@@ -449,9 +483,9 @@ FailureOr<SmallVector<Value>> collapseGenericOpIterationDimsEx(
   SmallVector<Value> outputOperands;
   resultTypes.reserve(genericOp.getNumDpsInits());
   outputOperands.reserve(genericOp.getNumDpsInits());
-  for (OpOperand *output : genericOp.getDpsInitOperands()) {
-    Value newOutput =
-        getCollapsedOpOperand(loc, genericOp, output, collapsingInfo, rewriter);
+  for (OpOperand &output : genericOp.getDpsInitsMutable()) {
+    Value newOutput = getCollapsedOpOperand(loc, genericOp, &output,
+                                            collapsingInfo, rewriter);
     outputOperands.push_back(newOutput);
     resultTypes.push_back(newOutput.getType());
   }
@@ -519,13 +553,17 @@ FailureOr<SmallVector<Value>> collapseGenericOpIterationDimsEx(
 class CollapseLoopsOnGenericOp : public OpRewritePattern<linalg::GenericOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
+  CollapseLoopsOnGenericOp(MLIRContext *context,
+                           utils::IteratorType iteratorType)
+      : OpRewritePattern(context), iteratorType(iteratorType) {}
+
   LogicalResult matchAndRewrite(linalg::GenericOp op,
                                 PatternRewriter &rewriter) const override {
     // Collect collapsible loops
     // TODO: All rules come from iree project, add our own
     if (!isEligibleForCollapse(op))
       return failure();
-    auto loops = getCollapsibleLoops(op);
+    auto loops = getCollapsibleLoops(op, iteratorType);
     if (loops.empty())
       return failure();
 
@@ -542,22 +580,31 @@ public:
     rewriter.replaceOp(op, *replacements);
     return success();
   }
+
+private:
+  utils::IteratorType iteratorType;
 };
 
 struct LinalgCollapseLoopsPass
     : public impl::LinalgCollapseLoopsBase<LinalgCollapseLoopsPass> {
+  LinalgCollapseLoopsPass(utils::IteratorType iteratorType)
+      : LinalgCollapseLoopsBase() {
+    this->iteratorType = iteratorType;
+  }
+
   void runOnOperation() override {
     auto op = getOperation();
     auto context = op->getContext();
 
     RewritePatternSet patterns(context);
-    patterns.add<CollapseLoopsOnGenericOp>(context);
+    patterns.add<CollapseLoopsOnGenericOp>(context, iteratorType);
     if (failed(applyPatternsAndFoldGreedily(op, std::move(patterns))))
       signalPassFailure();
   }
 };
 } // namespace
 
-std::unique_ptr<OperationPass<func::FuncOp>> mlir::createLinalgCollapseLoops() {
-  return std::make_unique<LinalgCollapseLoopsPass>();
+std::unique_ptr<OperationPass<func::FuncOp>>
+mlir::createLinalgCollapseLoops(utils::IteratorType iteratorType) {
+  return std::make_unique<LinalgCollapseLoopsPass>(iteratorType);
 }

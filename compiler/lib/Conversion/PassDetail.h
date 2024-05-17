@@ -65,10 +65,6 @@ namespace lace {
 class LaceDialect;
 } // namespace lace
 
-namespace lmhlo {
-class LmhloDialect;
-} // namespace lmhlo
-
 namespace linalg {
 class LinalgDialect;
 } // namespace linalg
@@ -100,6 +96,10 @@ class ShapeDialect;
 namespace tensor {
 class TensorDialect;
 } // namespace tensor
+
+namespace lccl {
+class LcclDialect;
+} // namespace lccl
 
 #define GEN_PASS_CLASSES
 #include "byteir/Conversion/Passes.h.inc"

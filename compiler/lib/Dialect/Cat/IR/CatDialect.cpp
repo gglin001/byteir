@@ -36,7 +36,6 @@ LogicalResult VerifyBMMLayout(Value lhs, Value rhs, Value out,
                               llvm::StringRef layoutStr) {
   auto lhsType = lhs.getType().cast<ShapedType>();
   auto rhsType = rhs.getType().cast<ShapedType>();
-  auto outType = out.getType().cast<ShapedType>();
   if (lhsType.getRank() != 3 || rhsType.getRank() != 3)
     return failure();
 
@@ -58,7 +57,7 @@ LogicalResult VerifyGemmLayout(Value lhs, Value rhs, Value out,
                                llvm::StringRef layoutStr) {
   auto lhsShape = lhs.getType().cast<ShapedType>().getShape();
   auto rhsShape = rhs.getType().cast<ShapedType>().getShape();
-  auto outShape = out.getType().cast<ShapedType>().getShape();
+  // auto outShape = out.getType().cast<ShapedType>().getShape();
   if (layoutStr == "rrr" && lhsShape[1] == rhsShape[0])
     return success();
   if (layoutStr == "rcr" && lhsShape[1] == rhsShape[1])
@@ -157,4 +156,10 @@ LogicalResult GemmRCRPermuteOp::verify() {
   return VerifyGemmPermute0213Layout(this->getLhs(), this->getRhs(),
                                      this->getOutput(), this->getT1(),
                                      this->getT2(), "rcr");
+}
+
+LogicalResult GemmRRRPermuteOp::verify() {
+  return VerifyGemmPermute0213Layout(this->getLhs(), this->getRhs(),
+                                     this->getOutput(), this->getT1(),
+                                     this->getT2(), "rrr");
 }

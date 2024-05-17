@@ -17,7 +17,7 @@ Most of ByteIR compiler passes are compatible with the selected upstream MLIR di
 
 ## Why ByteIR
 * **Enjoy SOTA models:**
-ByteIR maintains the popular frontends to handle lowering many SOTA models into Mhlo, and also provides a model zoo (release soon) for research or benchmarking purposes. 
+ByteIR maintains the popular frontends to handle lowering many SOTA models into Stablehlo, and also provides a model zoo (release soon) for research or benchmarking purposes. 
 * **Just work:**
 ByteIR adopts upstream MLIR dialects and Google Mhlo, and provides compatible passes, utilities, and infrastructure for all compiler builders using upstream MLIR. You can mix using ByteIR passes with upstream MLIR or Mhlo passes, or even your own passes to build your pipeline.  
 * **Bring your own architecture:**
@@ -46,26 +46,26 @@ ByteIR Frontends includes Tensorflow, PyTorch, and ONNX.
 Each ByteIR component technically can perform independently.
 There are pre-defined communication interface between components.
 
-### MHLO between frontends and compiler
-ByteIR frontends and ByteIR compiler communicate through Mhlo dialect, which version might be updated during development.
+### Stablehlo between frontends and compiler
+ByteIR frontends and ByteIR compiler communicate through Stablehlo dialect, which version might be updated during development.
 
-This also implies whatever frontend generating Mhlo with a compatible version can work with ByteIR compiler, and also whatever compiler consuming Mhlo with a compatible version can work with ByteIR frontends.
+This also implies whatever frontend generating Stablehlo with a compatible version can work with ByteIR compiler, and also whatever compiler consuming Stablehlo with a compatible version can work with ByteIR frontends.
 
 ### ByRE between compiler and runtime
 
 ByteIR compiler and ByteIR runtime communicates through ByRE format, which version might be updated during development.
 ByRE dialect is defined as a kind of ByRE format in ByteIR compiler, 
-currently supporting a textual form for ByteIR compiler and runtime.
+currently supporting emitting a textual form or bytecode with versioning for ByteIR compiler and runtime.
 
-The bytecode form of ByRE dialect with versioning will come very soon.
 Other ByRE formats are under development.
 
 
 ## Publication and Citation
 
-ByteIR is the product of many great researchers and interns in ByteDance. Below is a list of our publications:
+ByteIR is the product of many great researchers and interns in ByteDance. Below is a list of our public talks:
 
-* [Linalg is All You Need to Optimize Attention](compiler/paper/c4ml23_poster.pdf) -- C4ML'23
+* [Linalg is All You Need to Optimize Attention](talks/c4ml23_poster.pdf) -- C4ML'23
+* [ByteIR: Towards End-to-End AI Compilation](talks/ChinaSoftCon-ByteIR.pdf) -- China SoftCon'23
 
 
 If you find ByteIR useful, please consider citing.

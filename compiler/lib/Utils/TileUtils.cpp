@@ -17,6 +17,7 @@
 
 #include "byteir/Utils/TileUtils.h"
 #include "byteir/Dialect/Ccl/IR/CclOps.h"
+#include "byteir/Dialect/Linalg/Util/Util.h"
 #include "byteir/Dialect/SCF/Util/Util.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -91,7 +92,6 @@ static bool canOmitTileOffsetInBoundsCheck(OpFoldResult tileSize,
     return false;
   return *tileSizeConst * (*numThreadsConst - 1) < *iterSizeConst;
 }
-
 } // namespace
 
 SmallVector<OpFoldResult>
@@ -301,7 +301,8 @@ LogicalResult mlir::yieldTiledValuesForMultiDst(
         // TODO: there might be other types of all reduce
         Value cclRes = b.create<ccl::AllReduceOp>(
             loc, yieldedValue.value(), /*dynamic_replica_groups*/ nullptr,
-            ccl::getRedOpSumName(), /*replica_groups*/ nullptr,
+            /*synchronous*/ true, ccl::getRedOpSumName(),
+            /*replica_groups*/ nullptr,
             /*unique_id*/ nullptr);
         inserts.push_back(cclRes);
       } else {
@@ -335,7 +336,8 @@ LogicalResult mlir::tileToExistedLoops(
     ArrayRef<int64_t> interchange, ArrayRef<bool> useDistributdStyle,
     scf::SCFTileAndFuseResult &tileAndFuseResult) {
   OpBuilder::InsertionGuard guard(rewriter);
-  SmallVector<scf::ForOp> &loops = tileAndFuseResult.loops;
+  SmallVector<scf::ForOp> loops =
+      castToTypedOperations<scf::ForOp>(tileAndFuseResult.loops);
   assert(!loops.empty() && "loops is empty!");
   rewriter.setInsertionPoint(loops.back().getBody()->getTerminator());
 
@@ -440,5 +442,6 @@ LogicalResult mlir::tileToExistedLoops(
         loops.front()->getResult(oldNumResult + en.index());
   }
 
+  tileAndFuseResult.loops = getAsOperations(loops);
   return success();
 }

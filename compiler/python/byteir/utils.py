@@ -15,6 +15,7 @@
 import numpy as np
 from byteir import ir
 import torch
+from subprocess import PIPE, Popen
 
 def mlir_type_to_np_dtype(mlir_type):
     if str(mlir_type) == "f64":
@@ -41,8 +42,6 @@ def mlir_type_to_np_dtype(mlir_type):
         return np.uint8
     if str(mlir_type) == "i1":
         return np.bool_
-    if str(mlir_type) == "!tf_type.string":
-        return np.str_
     if str(mlir_type) == "!ace.string":
         return np.str_
     if str(mlir_type) == "index":
@@ -115,3 +114,44 @@ def torch_dtype_from_str(dtype_name: str) -> torch.dtype:
         "bool": torch.bool,
     }
     return _map.get(dtype_name, None)
+
+def get_gpu_type():
+    try:
+        proc = Popen(
+            ["nvidia-smi", "-L"],
+            stdout=PIPE,
+            stderr=PIPE,
+        )
+        stdout, stderr = proc.communicate()
+        stdout = stdout.decode("utf-8")
+        lines = stdout.split("\n")
+        # only check device 0
+        line = lines[0] 
+        # line is like: GPU 0: NVIDIA A10 (UUID: GPU-xxx-xxx-xxx-xxx-xxxx)
+        _, line = line.split(":", 1)
+        line, _ = line.split("(")
+        return line.strip()
+    except Exception:
+        return None
+
+def detect_cuda_with_nvidia_smi():
+    try:
+        proc = Popen(
+            ["nvidia-smi", "--query-gpu=gpu_name", "--format=csv"],
+            stdout=PIPE,
+            stderr=PIPE,
+        )
+        stdout, stderr = proc.communicate()
+        stdout = stdout.decode("utf-8")
+        sm_names = {
+            "sm_70": ["V100"],
+            "sm_75": ["T4", "Quadro T2000"],
+            "sm_80": ["PG509", "A100", "A10", "RTX 30", "A30", "RTX 40", "A16"],
+            "sm_90": ["H100"],
+        }
+        for sm, names in sm_names.items():
+            if any(name in stdout for name in names):
+                return sm
+        return None
+    except Exception:
+        return None

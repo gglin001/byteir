@@ -16,7 +16,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "torch-frontend/Conversion/ConvertTorchToCustomCall.h"
-#include "mhlo/IR/hlo_ops.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "stablehlo/dialect/StablehloOps.h"
@@ -31,9 +30,11 @@
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
 #include "torch-mlir/Dialect/TorchConversion/IR/TorchConversionOps.h"
 #include "torch-mlir/Dialect/TorchConversion/Transforms/BackendTypeConversion.h"
-#include "utils/convert_op_folder.h"
+#include "llvm/ADT/StringSet.h"
 
 #include "./PassDetail.h"
+
+#include <unordered_set>
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -46,71 +47,82 @@ llvm::SmallVector<NamedAttribute> getDefaultAttrs(PatternRewriter &rewriter) {
                      rewriter.getBoolAttr(false));
   attrs.emplace_back(rewriter.getStringAttr("backend_config"),
                      rewriter.getStringAttr(""));
-  attrs.emplace_back(rewriter.getStringAttr("api_version"),
-                     rewriter.getI32IntegerAttr(static_cast<int>(
-                         mhlo::CustomCallApiVersion::API_VERSION_ORIGINAL)));
+  attrs.emplace_back(
+      rewriter.getStringAttr("api_version"),
+      rewriter.getI32IntegerAttr(static_cast<int>(
+          stablehlo::CustomCallApiVersion::API_VERSION_ORIGINAL)));
   attrs.emplace_back(rewriter.getStringAttr("called_computations"),
                      rewriter.getArrayAttr({}));
   return attrs;
 }
 
 template <typename OP>
-mhlo::ConstantOp createInitialValueForReduceOp(PatternRewriter &rewriter,
-                                               Location loc, Type elementTy);
+stablehlo::ConstantOp createInitialValueForReduceOp(PatternRewriter &rewriter,
+                                                    Location loc,
+                                                    Type elementTy);
 
 template <>
-mhlo::ConstantOp
-createInitialValueForReduceOp<mhlo::MaxOp>(PatternRewriter &rewriter,
-                                           Location loc, Type elementTy) {
+stablehlo::ConstantOp
+createInitialValueForReduceOp<stablehlo::MaxOp>(PatternRewriter &rewriter,
+                                                Location loc, Type elementTy) {
   auto constType = RankedTensorType::get({}, elementTy);
   if (elementTy.isa<mlir::FloatType>()) {
     auto constAttr = DenseElementsAttr::get(
         constType,
         {APFloat::getInf(elementTy.cast<mlir::FloatType>().getFloatSemantics(),
                          /*negative=*/true)});
-    return rewriter.create<mhlo::ConstantOp>(loc, constType, constAttr);
+    return rewriter.create<stablehlo::ConstantOp>(loc, constType, constAttr);
   } else if (elementTy.isa<mlir::IntegerType>() &&
              elementTy.getIntOrFloatBitWidth() != 8) {
     auto constAttr = DenseElementsAttr::get(
         constType,
         {APInt::getSignedMinValue(elementTy.getIntOrFloatBitWidth())});
-    return rewriter.create<mhlo::ConstantOp>(loc, constType, constAttr);
+    return rewriter.create<stablehlo::ConstantOp>(loc, constType, constAttr);
   }
   assert(false && "unimplemented lowering in createInitialValueForReduceOp");
   return nullptr;
 }
 
 template <>
-mhlo::ConstantOp
-createInitialValueForReduceOp<mhlo::AddOp>(PatternRewriter &rewriter,
-                                           Location loc, Type elementTy) {
+stablehlo::ConstantOp
+createInitialValueForReduceOp<stablehlo::AddOp>(PatternRewriter &rewriter,
+                                                Location loc, Type elementTy) {
   auto constType = RankedTensorType::get({}, elementTy);
   if (elementTy.isa<mlir::FloatType>()) {
     auto constAttr = DenseElementsAttr::get(
         constType,
         {APFloat::getZero(elementTy.cast<mlir::FloatType>().getFloatSemantics(),
                           /*negative=*/false)});
-    return rewriter.create<mhlo::ConstantOp>(loc, constType, constAttr);
+    return rewriter.create<stablehlo::ConstantOp>(loc, constType, constAttr);
   } else if (elementTy.isa<mlir::IntegerType>() &&
              elementTy.getIntOrFloatBitWidth() != 8) {
     auto constAttr = DenseElementsAttr::get(
         constType, {APInt::getZero(elementTy.getIntOrFloatBitWidth())});
-    return rewriter.create<mhlo::ConstantOp>(loc, constType, constAttr);
+    return rewriter.create<stablehlo::ConstantOp>(loc, constType, constAttr);
   }
   assert(false && "unimplemented lowering in createInitialValueForReduceOp");
   return nullptr;
 }
 
 template <typename OP>
-mhlo::ReduceOp createSingleOpReduce(PatternRewriter &rewriter, Location loc,
-                                    Value input,
-                                    llvm::SmallVector<int64_t> dims) {
+stablehlo::ReduceOp createSingleOpReduce(PatternRewriter &rewriter,
+                                         Location loc, Value input,
+                                         llvm::SmallVector<int64_t> dims) {
   llvm::sort(dims.begin(), dims.end());
   auto inputType = input.getType().cast<RankedTensorType>();
-  mhlo::ConstantOp initValue = createInitialValueForReduceOp<OP>(
+  stablehlo::ConstantOp initValue = createInitialValueForReduceOp<OP>(
       rewriter, loc, inputType.getElementType());
-  mhlo::ReduceOp reduceOp = rewriter.create<mhlo::ReduceOp>(
-      loc, input, initValue.getOutput(), rewriter.getI64TensorAttr(dims));
+
+  std::unordered_set<int64_t> dimsSet(dims.begin(), dims.end());
+  SmallVector<int64_t> outputShape;
+  for (int64_t i = 0; i < inputType.getRank(); i++) {
+    if (dimsSet.find(i) == dimsSet.end()) {
+      outputShape.push_back(inputType.getDimSize(i));
+    }
+  }
+  stablehlo::ReduceOp reduceOp = rewriter.create<stablehlo::ReduceOp>(
+      loc, RankedTensorType::get(outputShape, inputType.getElementType()),
+      input, initValue.getOutput(), rewriter.getDenseI64ArrayAttr(dims));
 
   Block &block = reduceOp.getBody().emplaceBlock();
   auto blockArgumentTy = RankedTensorType::get({}, inputType.getElementType());
@@ -123,7 +135,7 @@ mhlo::ReduceOp createSingleOpReduce(PatternRewriter &rewriter, Location loc,
     rewriter.setInsertionPointToStart(&block);
     Value result = rewriter.create<OP>(loc, blockArgumentTy, firstArgument,
                                        secondArgument);
-    rewriter.create<mhlo::ReturnOp>(loc, result);
+    rewriter.create<stablehlo::ReturnOp>(loc, result);
   }
 
   return reduceOp;
@@ -138,35 +150,78 @@ Value promoteType(Location loc, Value input, TensorType desiredType,
 
   TensorType promotedType =
       inType.cloneWith(inType.getShape(), desiredType.getElementType());
-  return rewriter.create<mhlo::ConvertOp>(loc, promotedType, input);
+  return rewriter.create<stablehlo::ConvertOp>(loc, promotedType, input);
 }
+
+DenseFPElementsAttr getSplatFloatAttr(RankedTensorType type, double value) {
+  bool losesInfo;
+  APFloat v = APFloat(value);
+  v.convert(type.getElementType().cast<mlir::FloatType>().getFloatSemantics(),
+            APFloat::rmNearestTiesToEven, &losesInfo);
+  assert(!losesInfo && "should not lose info");
+  return DenseFPElementsAttr::get(type, {v});
+}
+
 } // namespace
 
 namespace {
 
-// AtenNativeLayerNormOp
-class ConvertAtenNativeLayerNormOp
-    : public OpConversionPattern<AtenNativeLayerNormOp> {
+// AtenNativeLayerNormOp & AtenLayerNormOp
+template <typename AtenOpT>
+class ConvertAtenLayerNormOp : public OpConversionPattern<AtenOpT> {
 public:
-  using OpConversionPattern::OpConversionPattern;
-
+  using OpConversionPattern<AtenOpT>::OpConversionPattern;
+  using OpAdaptor = typename AtenOpT::Adaptor;
   LogicalResult
-  matchAndRewrite(AtenNativeLayerNormOp op, OpAdaptor adaptor,
+  matchAndRewrite(AtenOpT op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    RankedTensorType outType = getTypeConverter()
-                                   ->convertType(op.getResultTypes()[0])
-                                   .cast<RankedTensorType>();
+    mlir::RankedTensorType outType =
+        OpConversionPattern<AtenOpT>::getTypeConverter()
+            ->convertType(op->getResultTypes()[0])
+            .template cast<RankedTensorType>();
+    mlir::FloatType outElementType =
+        outType.getElementType().template cast<mlir::FloatType>();
+
+    // promote input
     Value input =
         promoteType(op->getLoc(), adaptor.getInput(), outType, rewriter);
-    Value weight =
-        promoteType(op->getLoc(), adaptor.getWeight(), outType, rewriter);
-    Value bias =
-        promoteType(op->getLoc(), adaptor.getBias(), outType, rewriter);
+    auto inputType = input.getType().template cast<RankedTensorType>();
+    // infer the axis list and axis shape
+    llvm::SmallVector<int64_t> normalizedShape;
+    if (!matchPattern(op.getNormalizedShape(),
+                      m_TorchListOfConstantInts(normalizedShape))) {
+      return op.emitError("normalizedShape must be a int list");
+    }
+    auto inputShape = inputType.getShape();
+    std::vector<int64_t> axisList;
+    std::vector<int64_t> axisShape;
+    for (size_t i = 0; i < normalizedShape.size(); ++i) {
+      axisList.push_back(inputShape.size() - 1 - i);
+      axisShape.push_back(inputShape[inputShape.size() - 1 - i]);
+    }
+    std::reverse(axisList.begin(), axisList.end());
+    std::reverse(axisShape.begin(), axisShape.end());
+    // construct or promote weight/bias
+    Value weight = adaptor.getWeight();
+    Value bias = adaptor.getBias();
+    mlir::RankedTensorType weightBiasType =
+        RankedTensorType::get(axisShape, outElementType);
+    if (weight.getType().template isa<Torch::NoneType>()) {
+      weight = rewriter.create<stablehlo::ConstantOp>(
+          op->getLoc(), getSplatFloatAttr(weightBiasType, 1.0));
+    }
+    if (bias.getType().template isa<Torch::NoneType>()) {
+      bias = rewriter.create<stablehlo::ConstantOp>(
+          op->getLoc(), getSplatFloatAttr(weightBiasType, 0.0));
+    }
+    weight = promoteType(op->getLoc(), weight, outType, rewriter);
+    bias = promoteType(op->getLoc(), bias, outType, rewriter);
+
+    // collect inputs/outputs
     SmallVector<Value> bufferArgs({input, weight, bias});
-    RankedTensorType inType = input.getType().cast<RankedTensorType>();
     SmallVector<Type> resultTypes;
-    if (failed(getTypeConverter()->convertTypes(op.getResultTypes(),
-                                                resultTypes))) {
+    if (failed(OpConversionPattern<AtenOpT>::getTypeConverter()->convertTypes(
+            op->getResultTypes(), resultTypes))) {
       return op.emitError("could not convert output types");
     }
 
@@ -175,116 +230,11 @@ public:
       return op.emitError("eps must be a scalar constant");
     }
 
-    SmallVector<int64_t> normalizedShape;
-    if (!matchPattern(op.getNormalizedShape(),
-                      m_TorchListOfConstantInts(normalizedShape))) {
-      return op.emitError("eps must be a int list");
-    }
-    // Infer the axis list
-    ArrayRef<int64_t> inShape = inType.getShape();
-    std::vector<int64_t> axisValue;
-    for (size_t i = 0; i < normalizedShape.size(); ++i) {
-      axisValue.push_back(inShape.size() - 1 - i);
-    }
-    std::reverse(axisValue.begin(), axisValue.end());
-
     std::vector<NamedAttribute> byteir_attrs;
     byteir_attrs.emplace_back(rewriter.getStringAttr("epsilon"),
                               rewriter.getF64FloatAttr(epsValue));
     byteir_attrs.emplace_back(rewriter.getStringAttr("axis"),
-                              rewriter.getI64ArrayAttr(axisValue));
-
-    auto attrs = getDefaultAttrs(rewriter);
-    attrs.emplace_back(rewriter.getStringAttr("call_target_name"),
-                       rewriter.getStringAttr(getLayerNormName()));
-    attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
-                       rewriter.getDictionaryAttr(byteir_attrs));
-
-    if (op.getResults()[1].use_empty() && op.getResults()[2].use_empty()) {
-      auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
-          op->getLoc(), ArrayRef<Type>{resultTypes[0]}, bufferArgs,
-          ArrayRef<NamedAttribute>{attrs});
-      rewriter.replaceOp(
-          op, ArrayRef<Value>{customCallOp.getResults()[0], Value(), Value()});
-      return success();
-    } else {
-      auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
-          op->getLoc(), resultTypes, bufferArgs,
-          ArrayRef<NamedAttribute>{attrs});
-      rewriter.replaceOp(op, customCallOp->getResults());
-      return success();
-    }
-  }
-};
-
-// AtenLayerNormOp
-class ConvertAtenLayerNormOp : public OpConversionPattern<AtenLayerNormOp> {
-public:
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(AtenLayerNormOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    RankedTensorType outType = getTypeConverter()
-                                   ->convertType(op.getResult().getType())
-                                   .cast<RankedTensorType>();
-    Value input =
-        promoteType(op->getLoc(), adaptor.getInput(), outType, rewriter);
-    Value weight = adaptor.getWeight();
-    Value bias = adaptor.getBias();
-    auto inputTy = input.getType().cast<RankedTensorType>();
-    auto inputElemTy = inputTy.getElementType();
-    Value channelDim =
-        rewriter.create<mlir::tensor::DimOp>(op->getLoc(), input, 1);
-    Value channelShape = rewriter.create<mlir::tensor::FromElementsOp>(
-        op->getLoc(), ValueRange{channelDim});
-    auto biasType = bias.getType();
-    if (biasType.isa<mlir::NoneType>() || biasType.isa<Torch::NoneType>()) {
-      bias = hlo::getConstantOfShape(
-          rewriter, op->getLoc(),
-          {APFloat::getZero(
-              inputElemTy.cast<mlir::FloatType>().getFloatSemantics(),
-              /*negative=*/false)},
-          channelShape,
-          RankedTensorType::get({inputTy.getShape()[1]}, inputElemTy));
-    }
-    auto weightType = weight.getType();
-    if (weightType.isa<mlir::NoneType>() || weightType.isa<Torch::NoneType>()) {
-      weight = hlo::getConstantOfShape(
-          rewriter, op->getLoc(),
-          {APFloat::getAllOnesValue(
-              inputElemTy.cast<mlir::FloatType>().getFloatSemantics())},
-          channelShape,
-          RankedTensorType::get({inputTy.getShape()[1]}, inputElemTy));
-    }
-    bias = promoteType(op->getLoc(), bias, outType, rewriter);
-    weight = promoteType(op->getLoc(), weight, outType, rewriter);
-
-    SmallVector<Value> bufferArgs({input, weight, bias});
-    RankedTensorType inType = input.getType().cast<RankedTensorType>();
-    double epsValue;
-    if (!matchPattern(op.getEps(), m_TorchConstantFloat(&epsValue))) {
-      return op.emitError("eps must be a scalar constant");
-    }
-
-    SmallVector<int64_t> normalizedShape;
-    if (!matchPattern(op.getNormalizedShape(),
-                      m_TorchListOfConstantInts(normalizedShape))) {
-      return op.emitError("eps must be a int list");
-    }
-    // Infer the axis list
-    ArrayRef<int64_t> inShape = inType.getShape();
-    std::vector<int64_t> axisValue;
-    for (size_t i = 0; i < normalizedShape.size(); ++i) {
-      axisValue.push_back(inShape.size() - 1 - i);
-    }
-    std::reverse(axisValue.begin(), axisValue.end());
-
-    std::vector<NamedAttribute> byteir_attrs;
-    byteir_attrs.emplace_back(rewriter.getStringAttr("epsilon"),
-                              rewriter.getF64FloatAttr(epsValue));
-    byteir_attrs.emplace_back(rewriter.getStringAttr("axis"),
-                              rewriter.getI64ArrayAttr(axisValue));
+                              rewriter.getI64ArrayAttr(axisList));
     if (op->hasAttr("eps_outside_sqrt")) {
       byteir_attrs.emplace_back(rewriter.getStringAttr("eps_outside_sqrt"),
                                 op->getAttr("eps_outside_sqrt"));
@@ -295,11 +245,121 @@ public:
                        rewriter.getStringAttr(getLayerNormName()));
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
-        op->getLoc(), outType, bufferArgs, ArrayRef<NamedAttribute>{attrs});
-    rewriter.replaceOp(op, customCallOp->getResults());
 
+    if constexpr (std::is_same_v<AtenOpT, AtenNativeLayerNormOp>) {
+      if (op->getResult(1).use_empty() && op->getResult(2).use_empty()) {
+        auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
+            op->getLoc(), ArrayRef<Type>{resultTypes[0]}, bufferArgs,
+            ArrayRef<NamedAttribute>{attrs});
+        rewriter.replaceOp(op, ArrayRef<Value>{customCallOp.getResults()[0],
+                                               Value(), Value()});
+        return success();
+      }
+    }
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
+        op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>{attrs});
+    rewriter.replaceOp(op, customCallOp->getResults());
     return success();
+  }
+};
+
+// AtenNativeGroupNormOp & AtenGroupNormOp
+template <typename AtenOpT>
+class ConvertAtenGroupNormOp : public OpConversionPattern<AtenOpT> {
+public:
+  using OpConversionPattern<AtenOpT>::OpConversionPattern;
+  using OpAdaptor = typename AtenOpT::Adaptor;
+  LogicalResult
+  matchAndRewrite(AtenOpT op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    RankedTensorType outType = OpConversionPattern<AtenOpT>::getTypeConverter()
+                                   ->convertType(op->getResultTypes()[0])
+                                   .template cast<RankedTensorType>();
+    if (!outType.hasStaticShape()) {
+      return op.emitError("must be static shape");
+    }
+
+    Value input = adaptor.getInput();
+    Value weight = adaptor.getWeight();
+    Value bias = adaptor.getBias();
+    int64_t group = -999;
+    if constexpr (std::is_same_v<AtenOpT, AtenNativeGroupNormOp>) {
+      if (!matchPattern(op.getGroup(), m_TorchConstantInt(&group))) {
+        return op.emitError("group must be constant int");
+      }
+    } else if constexpr (std::is_same_v<AtenOpT, AtenGroupNormOp>) {
+      if (!matchPattern(op.getNumGroups(), m_TorchConstantInt(&group))) {
+        return op.emitError("num_groups must be constant int");
+      }
+    }
+    if (outType.getDimSize(1) % group != 0) {
+      return op.emitError("channel size must be divisible by group size");
+    }
+    if constexpr (std::is_same_v<AtenOpT, AtenNativeGroupNormOp>) {
+      if (!op.getResults()[1].use_empty() || !op.getResults()[2].use_empty()) {
+        return op.emitError(
+            "can't convert native_group_norm to byteir.layer_norm");
+      }
+    }
+    double eps;
+    if (!matchPattern(op.getEps(), m_TorchConstantFloat(&eps))) {
+      return op.emitError("eps must be constant float");
+    }
+
+    // construct layer_norm weight/bias and pre-reshape
+    int64_t N = outType.getDimSize(0);
+    int64_t HW = outType.getNumElements() / (N * group);
+    RankedTensorType reshapeType = RankedTensorType::get(
+        ArrayRef<int64_t>{N, group, HW}, outType.getElementType());
+    RankedTensorType weightBiasType =
+        RankedTensorType::get(ArrayRef<int64_t>{HW}, outType.getElementType());
+    Value layerNormWeight = rewriter.create<stablehlo::ConstantOp>(
+        op->getLoc(), getSplatFloatAttr(weightBiasType, 1.0));
+    Value layerNormBias = rewriter.create<stablehlo::ConstantOp>(
+        op->getLoc(), getSplatFloatAttr(weightBiasType, 0.0));
+    Value preReshape =
+        rewriter.create<stablehlo::ReshapeOp>(op->getLoc(), reshapeType, input);
+
+    // construct byteir.layer_norm
+    SmallVector<Value> bufferArgs({preReshape, layerNormWeight, layerNormBias});
+    SmallVector<Type> resultTypes({reshapeType});
+    std::vector<NamedAttribute> byteir_attrs;
+    byteir_attrs.emplace_back(rewriter.getStringAttr("epsilon"),
+                              rewriter.getF64FloatAttr(eps));
+    byteir_attrs.emplace_back(rewriter.getStringAttr("axis"),
+                              rewriter.getI64ArrayAttr({2}));
+    auto attrs = getDefaultAttrs(rewriter);
+    attrs.emplace_back(rewriter.getStringAttr("call_target_name"),
+                       rewriter.getStringAttr(getLayerNormName()));
+    attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
+                       rewriter.getDictionaryAttr(byteir_attrs));
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
+        op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>{attrs});
+
+    // post-reshape
+    Value result = rewriter.create<stablehlo::ReshapeOp>(
+        op->getLoc(), outType, customCallOp->getResult(0));
+    // group_norm weight/bias
+    if (!weight.getType().template isa<Torch::NoneType>()) {
+      Value bcastWeight = rewriter.create<stablehlo::BroadcastInDimOp>(
+          op->getLoc(), outType, weight, rewriter.getDenseI64ArrayAttr({1}));
+      result =
+          rewriter.create<stablehlo::MulOp>(op->getLoc(), result, bcastWeight);
+    }
+    if (!bias.getType().template isa<Torch::NoneType>()) {
+      Value bcastBias = rewriter.create<stablehlo::BroadcastInDimOp>(
+          op->getLoc(), outType, bias, rewriter.getDenseI64ArrayAttr({1}));
+      result =
+          rewriter.create<stablehlo::AddOp>(op->getLoc(), result, bcastBias);
+    }
+
+    if constexpr (std::is_same_v<AtenOpT, AtenNativeGroupNormOp>) {
+      rewriter.replaceOp(op, ArrayRef<Value>{result, Value(), Value()});
+      return success();
+    } else {
+      rewriter.replaceOp(op, result);
+      return success();
+    }
   }
 };
 
@@ -338,7 +398,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto newOp = rewriter.create<mhlo::CustomCallOp>(
+    auto newOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, newOp->getResults());
     return success();
@@ -380,7 +440,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto newOp = rewriter.create<mhlo::CustomCallOp>(
+    auto newOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, newOp->getResults());
     return success();
@@ -417,7 +477,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto newOp = rewriter.create<mhlo::CustomCallOp>(
+    auto newOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, newOp->getResults());
     return success();
@@ -468,7 +528,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
@@ -508,32 +568,8 @@ public:
                                              "keepdim is not constant bool");
     }
 
-    if (op.getResults()[1].use_empty()) { // simplify to mhlo.reduce
-      auto reduceOp = createSingleOpReduce<mhlo::MaxOp>(rewriter, op->getLoc(),
-                                                        input, {dimInt});
-      if (keepDim) {
-        auto inputShapeInfo = hlo::getDimSizesOfTensor(rewriter, op, input,
-                                                       /*dimSizeIndexBits=*/64);
-        if (failed(inputShapeInfo)) {
-          return rewriter.notifyMatchFailure(
-              op, "failed to get dimension sizes of the input");
-        }
-        auto outputShapeVec = *inputShapeInfo;
-        outputShapeVec[dimInt] = rewriter.create<mlir::arith::ConstantOp>(
-            op->getLoc(),
-            rewriter.getIntegerAttr(rewriter.getIntegerType(64), 1));
-        auto outputShapeTensor = rewriter.create<mlir::tensor::FromElementsOp>(
-            op->getLoc(), outputShapeVec);
-        Value reshapeResult = rewriter.create<mhlo::DynamicReshapeOp>(
-            op->getLoc(), resultTypes[0], reduceOp.getResults()[0],
-            outputShapeTensor);
-        rewriter.replaceOp(op, ArrayRef<Value>{reshapeResult, Value()});
-        return success();
-      } else {
-        rewriter.replaceOp(op,
-                           ArrayRef<Value>{reduceOp.getResults()[0], Value()});
-        return success();
-      }
+    if (op.getResults()[1].use_empty()) { // should simplify to stablehlo.reduce
+      return failure();
     }
 
     std::vector<NamedAttribute> byteir_attrs;
@@ -551,14 +587,14 @@ public:
                        rewriter.getDictionaryAttr(byteir_attrs));
 
     if (op.getResults()[0].use_empty()) {
-      auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+      auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
           op->getLoc(), ArrayRef<Type>{resultTypes[1]}, bufferArgs,
           ArrayRef<NamedAttribute>{attrs});
       rewriter.replaceOp(
           op, ArrayRef<Value>{Value(), customCallOp.getResults()[0]});
       return success();
     } else {
-      auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+      auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
           op->getLoc(), resultTypes, bufferArgs,
           ArrayRef<NamedAttribute>{attrs});
       rewriter.replaceOp(op, customCallOp->getResults());
@@ -608,7 +644,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
@@ -672,7 +708,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
@@ -726,7 +762,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
@@ -763,7 +799,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
@@ -800,7 +836,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
@@ -854,7 +890,7 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>{attrs});
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
@@ -906,8 +942,272 @@ public:
     attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
                        rewriter.getDictionaryAttr(byteir_attrs));
 
-    auto customCallOp = rewriter.create<mhlo::CustomCallOp>(
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
         op->getLoc(), resultType, bufferArgs, ArrayRef<NamedAttribute>{attrs});
+    rewriter.replaceOp(op, customCallOp->getResults());
+    return success();
+  }
+};
+
+// torch.operator "byteir.flash_attn_fwd"
+// operands: q, k, v, dropout_p, softmax_scale, causal, return_softmax
+// results: out, q_padded, k_padded, v_padded, out_padded, softmax_lse,
+// softmax_return, rng
+//
+// converts to
+//
+// q_padded = pad(q)
+// k_padded = pad(k)
+// v_padded = pad(v)
+// out_padded, softmax_lse, softmax_return, rng = custom_call(q_padded,
+//                                                  k_padded, v_padded)
+// out = slice(out_padded)
+//
+// CustomCall:
+// operands: q_padded, k_padded, v_padded
+// Attributes: dropout_p, softmax_scale, causal, return_softmax
+// results: out_padded, softmax_lse, softmax_return, rng
+
+class ConvertFlashAttnFwdOp : public OpConversionPattern<OperatorOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(OperatorOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto opName = adaptor.getName();
+    if (opName != getFlashAttnFwdName())
+      return rewriter.notifyMatchFailure(op, "op name not match");
+
+    auto operands = adaptor.getOperands();
+    Value q = operands[0];
+    Value k = operands[1];
+    Value v = operands[2];
+
+    double dropoutP;
+    if (!matchPattern(op.getOperand(3), m_TorchConstantFloat(&dropoutP)))
+      return rewriter.notifyMatchFailure(op,
+                                         "dropout rate must be constant float");
+    double softmaxScale;
+    if (!matchPattern(op.getOperand(4), m_TorchConstantFloat(&softmaxScale)))
+      return rewriter.notifyMatchFailure(
+          op, "softmax scale must be constant float");
+    bool causal;
+    if (!matchPattern(op.getOperand(5), m_TorchConstantBool(&causal)))
+      return rewriter.notifyMatchFailure(op, "causal must be constant bool");
+    bool returnSoftmax;
+    if (!matchPattern(op.getOperand(6), m_TorchConstantBool(&returnSoftmax)))
+      return rewriter.notifyMatchFailure(
+          op, "return softmax must be constant bool");
+
+    // TODO: pad q, k, v
+    SmallVector<Value> bufferArgs({q, k, v});
+    Type outputPadTy = op.getResult(4).getType();
+    Type softmaxLseTy = op.getResult(5).getType();
+    Type softmaxTy = op.getResult(6).getType();
+    Type rngTy = op.getResult(7).getType();
+    // Do not need softmax return if there's no use
+    if (op.getResult(6).use_empty())
+      returnSoftmax = false;
+
+    SmallVector<Type> resultTypes;
+    if (failed(getTypeConverter()->convertTypes(
+            {outputPadTy, softmaxLseTy, softmaxTy, rngTy}, resultTypes))) {
+      return op.emitError("could not convert output types");
+    }
+
+    std::vector<NamedAttribute> byteir_attrs;
+    byteir_attrs.emplace_back(rewriter.getStringAttr("dropout_p"),
+                              rewriter.getF64FloatAttr(dropoutP));
+    byteir_attrs.emplace_back(rewriter.getStringAttr("softmax_scale"),
+                              rewriter.getF64FloatAttr(softmaxScale));
+    byteir_attrs.emplace_back(rewriter.getStringAttr("causal"),
+                              rewriter.getBoolAttr(causal));
+    byteir_attrs.emplace_back(rewriter.getStringAttr("return_softmax"),
+                              rewriter.getBoolAttr(returnSoftmax));
+
+    auto attrs = getDefaultAttrs(rewriter);
+    attrs.emplace_back(rewriter.getStringAttr("call_target_name"),
+                       rewriter.getStringAttr(getFlashAttnFwdName()));
+    attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
+                       rewriter.getDictionaryAttr(byteir_attrs));
+
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
+        op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>{attrs});
+    // TODO: slice out_pad, use padded q, k, v
+    Value outPad = customCallOp.getResult(0);
+    Value softmaxLse = customCallOp.getResult(1);
+    Value softmaxReturn = customCallOp.getResult(2);
+    Value rngState = customCallOp.getResult(3);
+    mlir::ValueRange results{outPad,        q,       k, v, outPad, softmaxLse,
+                             softmaxReturn, rngState};
+    rewriter.replaceOp(op, results);
+    return success();
+  }
+};
+
+// torch.operator "byteir.flash_attn_bwd"
+// operands: dout, q, k, v, out, softmax_lse, dropout_p,
+// softmax_scale, causal, rng_state
+// results: dq, dk, dv, d_softmax, dq_accum
+//
+// CustomCall:
+// operands: dout, q, k, v, out, softmax_lse, rng_state
+// Attributes: dropout_p, softmax_scale, causal
+// results: dq, dk, dv, d_softmax, dq_accum
+
+class ConvertFlashAttnBwdOp : public OpConversionPattern<OperatorOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(OperatorOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto opName = adaptor.getName();
+    if (opName != getFlashAttnBwdName())
+      return rewriter.notifyMatchFailure(op, "op name not match");
+
+    auto operands = adaptor.getOperands();
+    Value dout = operands[0];
+    Value q = operands[1];
+    Value k = operands[2];
+    Value v = operands[3];
+    Value out = operands[4];
+    Value softmax_lse = operands[5];
+    Value rng_state = operands[9];
+
+    double dropoutP;
+    if (!matchPattern(op.getOperand(6), m_TorchConstantFloat(&dropoutP)))
+      return rewriter.notifyMatchFailure(op,
+                                         "dropout rate must be constant float");
+    double softmaxScale;
+    if (!matchPattern(op.getOperand(7), m_TorchConstantFloat(&softmaxScale)))
+      return rewriter.notifyMatchFailure(
+          op, "softmax scale must be constant float");
+    bool causal;
+    if (!matchPattern(op.getOperand(8), m_TorchConstantBool(&causal)))
+      return rewriter.notifyMatchFailure(op, "causal must be constant bool");
+
+    SmallVector<Value> bufferArgs({dout, q, k, v, out, softmax_lse, rng_state});
+    Type dqTy = op.getResult(0).getType();
+    Type dkTy = op.getResult(1).getType();
+    Type dvTy = op.getResult(2).getType();
+    Type dSoftmaxTy = op.getResult(3).getType();
+    Type dqAccumTy = op.getResult(4).getType();
+    SmallVector<Type> resultTypes;
+    if (failed(getTypeConverter()->convertTypes(
+            {dqTy, dkTy, dvTy, dSoftmaxTy, dqAccumTy}, resultTypes))) {
+      return op.emitError("could not convert output types");
+    }
+
+    std::vector<NamedAttribute> byteir_attrs;
+    byteir_attrs.emplace_back(rewriter.getStringAttr("dropout_p"),
+                              rewriter.getF64FloatAttr(dropoutP));
+    byteir_attrs.emplace_back(rewriter.getStringAttr("softmax_scale"),
+                              rewriter.getF64FloatAttr(softmaxScale));
+    byteir_attrs.emplace_back(rewriter.getStringAttr("causal"),
+                              rewriter.getBoolAttr(causal));
+
+    auto attrs = getDefaultAttrs(rewriter);
+    attrs.emplace_back(rewriter.getStringAttr("call_target_name"),
+                       rewriter.getStringAttr(getFlashAttnBwdName()));
+    attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
+                       rewriter.getDictionaryAttr(byteir_attrs));
+
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
+        op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>{attrs});
+    rewriter.replaceOp(op, customCallOp);
+    return success();
+  }
+};
+
+class ConvertFlashAttnKVCacheOp : public OpConversionPattern<OperatorOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(OperatorOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto opName = adaptor.getName();
+    if (opName != getFlashAttnKVCacheName())
+      return rewriter.notifyMatchFailure(op, "op name not match");
+
+    auto operands = adaptor.getOperands();
+    Value q = operands[0];
+    Value k = operands[1];
+    Value v = operands[2];
+    Value kcache = operands[3];
+    Value vcache = operands[4];
+    Value seqlenK = operands[5];
+
+    double softmaxScale;
+    if (!matchPattern(op.getOperand(6), m_TorchConstantFloat(&softmaxScale)))
+      return rewriter.notifyMatchFailure(
+          op, "softmax scale must be constant float");
+    bool causal;
+    if (!matchPattern(op.getOperand(7), m_TorchConstantBool(&causal)))
+      return rewriter.notifyMatchFailure(op, "causal must be constant bool");
+
+    SmallVector<Value> bufferArgs({q, kcache, vcache, k, v, seqlenK});
+    Type outputPadTy = op.getResult(0).getType();
+    Type softmaxLseTy = op.getResult(1).getType();
+
+    SmallVector<Type> resultTypes;
+    if (failed(getTypeConverter()->convertTypes({outputPadTy, softmaxLseTy},
+                                                resultTypes))) {
+      return op.emitError("could not convert output types");
+    }
+
+    std::vector<NamedAttribute> byteir_attrs;
+    byteir_attrs.emplace_back(rewriter.getStringAttr("softmax_scale"),
+                              rewriter.getF64FloatAttr(softmaxScale));
+    byteir_attrs.emplace_back(rewriter.getStringAttr("causal"),
+                              rewriter.getBoolAttr(causal));
+
+    auto attrs = getDefaultAttrs(rewriter);
+    attrs.emplace_back(rewriter.getStringAttr("call_target_name"),
+                       rewriter.getStringAttr(getFlashAttnKVCacheName()));
+    attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
+                       rewriter.getDictionaryAttr(byteir_attrs));
+
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
+        op->getLoc(), resultTypes, bufferArgs, ArrayRef<NamedAttribute>{attrs});
+    Value out = customCallOp.getResult(0);
+    Value softmaxLse = customCallOp.getResult(1);
+    mlir::ValueRange results{out, softmaxLse};
+    rewriter.replaceOp(op, results);
+    return success();
+  }
+};
+} // namespace
+
+// aten.nonzero
+namespace {
+class ConvertAtenNonzeroOp : public OpConversionPattern<AtenNonzeroOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(AtenNonzeroOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Value input = adaptor.getSelf();
+    auto inputType = input.getType().template cast<RankedTensorType>();
+    SmallVector<Value> bufferArgs({input});
+    Type resultType = getTypeConverter()->convertType(op.getResult().getType());
+    if (!resultType) {
+      return op.emitError("could not convert output types");
+    }
+
+    std::vector<NamedAttribute> byteir_attrs;
+
+    auto attrs = getDefaultAttrs(rewriter);
+    attrs.emplace_back(rewriter.getStringAttr("call_target_name"),
+                       rewriter.getStringAttr(getNonZeroName()));
+    attrs.emplace_back(rewriter.getStringAttr(getCustomCallAttrName()),
+                       rewriter.getDictionaryAttr(byteir_attrs));
+
+    auto customCallOp = rewriter.create<stablehlo::CustomCallOp>(
+        op->getLoc(), TypeRange{resultType}, bufferArgs,
+        ArrayRef<NamedAttribute>(attrs));
     rewriter.replaceOp(op, customCallOp->getResults());
     return success();
   }
@@ -918,9 +1218,12 @@ namespace {
 class ConvertTorchToCustomCall
     : public ConvertTorchToCustomCallBase<ConvertTorchToCustomCall> {
 public:
+  ConvertTorchToCustomCall(ArrayRef<std::string> validCustomCallOps) {
+    this->validCustomCallOps = validCustomCallOps;
+  }
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<Torch::TorchDialect>();
-    registry.insert<mhlo::MhloDialect>();
     registry.insert<arith::ArithDialect>();
     registry.insert<tensor::TensorDialect>();
     registry.insert<stablehlo::StablehloDialect>();
@@ -930,58 +1233,115 @@ public:
   void runOnOperation() override {
     MLIRContext *context = &getContext();
     ConversionTarget target(*context);
-    target.addLegalDialect<Torch::TorchDialect, mhlo::MhloDialect,
-                           arith::ArithDialect, tensor::TensorDialect,
-                           stablehlo::StablehloDialect>();
+    target
+        .addLegalDialect<Torch::TorchDialect, arith::ArithDialect,
+                         tensor::TensorDialect, stablehlo::StablehloDialect>();
+
+    validCustomCallOpsSet.clear();
+    validCustomCallOpsSet.insert(validCustomCallOps.begin(),
+                                 validCustomCallOps.end());
 
     TypeConverter typeConverter;
     typeConverter.addConversion([](Type type) { return type; });
     TorchConversion::setupBackendTypeConversion(target, typeConverter);
 
     RewritePatternSet patterns(context);
-    target.addIllegalOp<AtenNativeLayerNormOp>();
-    patterns.add<ConvertAtenNativeLayerNormOp>(typeConverter, context);
-    target.addIllegalOp<AtenLayerNormOp>();
-    patterns.add<ConvertAtenLayerNormOp>(typeConverter, context);
-    target.addIllegalOp<Aten_SoftmaxOp>();
-    patterns.add<ConvertAtenSoftmaxOp<Aten_SoftmaxOp>>(typeConverter, context);
-    target.addIllegalOp<AtenSoftmaxIntOp>();
-    patterns.add<ConvertAtenSoftmaxOp<AtenSoftmaxIntOp>>(typeConverter,
+    if (validCustomCallOpsSet.contains("aten.native_layer_norm")) {
+      target.addIllegalOp<AtenNativeLayerNormOp>();
+      patterns.add<ConvertAtenLayerNormOp<AtenNativeLayerNormOp>>(typeConverter,
+                                                                  context);
+    }
+    if (validCustomCallOpsSet.contains("aten.layer_norm")) {
+      target.addIllegalOp<AtenLayerNormOp>();
+      patterns.add<ConvertAtenLayerNormOp<AtenLayerNormOp>>(typeConverter,
+                                                            context);
+    }
+    if (validCustomCallOpsSet.contains("aten.native_group_norm")) {
+      target.addIllegalOp<AtenNativeGroupNormOp>();
+      patterns.add<ConvertAtenGroupNormOp<AtenNativeGroupNormOp>>(typeConverter,
+                                                                  context);
+    }
+    if (validCustomCallOpsSet.contains("aten.group_norm")) {
+      target.addIllegalOp<AtenGroupNormOp>();
+      patterns.add<ConvertAtenGroupNormOp<AtenGroupNormOp>>(typeConverter,
+                                                            context);
+    }
+    if (validCustomCallOpsSet.contains("aten._softmax")) {
+      target.addIllegalOp<Aten_SoftmaxOp>();
+      patterns.add<ConvertAtenSoftmaxOp<Aten_SoftmaxOp>>(typeConverter,
                                                          context);
-    target.addIllegalOp<Aten_LogSoftmaxOp>();
-    patterns.add<ConvertAtenLogSoftmaxOp<Aten_LogSoftmaxOp>>(typeConverter,
-                                                             context);
-    target.addIllegalOp<AtenLogSoftmaxIntOp>();
-    patterns.add<ConvertAtenLogSoftmaxOp<AtenLogSoftmaxIntOp>>(typeConverter,
+    }
+    if (validCustomCallOpsSet.contains("aten.softmax.int")) {
+      target.addIllegalOp<AtenSoftmaxIntOp>();
+      patterns.add<ConvertAtenSoftmaxOp<AtenSoftmaxIntOp>>(typeConverter,
+                                                           context);
+    }
+    if (validCustomCallOpsSet.contains("aten._log_softmax")) {
+      target.addIllegalOp<Aten_LogSoftmaxOp>();
+      patterns.add<ConvertAtenLogSoftmaxOp<Aten_LogSoftmaxOp>>(typeConverter,
                                                                context);
-    target.addIllegalOp<AtenNllLossForwardOp>();
-    patterns.add<ConvertAtenNllLossForwardOp>(typeConverter, context);
-    target.addIllegalOp<AtenNllLossBackwardOp>();
-    patterns.add<ConvertAtenNllLossBackwardOp>(typeConverter, context);
-    target.addIllegalOp<AtenGeluOp>();
-    patterns.add<ConvertAtenGeluOp>(typeConverter, context);
-    target.addIllegalOp<AtenArgmaxOp>();
-    patterns.add<ConvertAtenArgmaxOp>(typeConverter, context);
-    target.addIllegalOp<AtenMaxDimOp>();
-    patterns.add<ConvertAtenMaxDimOp>(typeConverter, context);
-    target.addIllegalOp<AtenOneHotOp>();
-    patterns.add<ConvertAtenOneHotOp>(typeConverter, context);
-    target.addIllegalOp<AtenTopkOp>();
-    patterns.add<ConvertAtenTopkOp>(typeConverter, context);
+    }
+    if (validCustomCallOpsSet.contains("aten.log_softmax.int")) {
+      target.addIllegalOp<AtenLogSoftmaxIntOp>();
+      patterns.add<ConvertAtenLogSoftmaxOp<AtenLogSoftmaxIntOp>>(typeConverter,
+                                                                 context);
+    }
+    if (validCustomCallOpsSet.contains("aten.nll_loss_forward")) {
+      target.addIllegalOp<AtenNllLossForwardOp>();
+      patterns.add<ConvertAtenNllLossForwardOp>(typeConverter, context);
+    }
+    if (validCustomCallOpsSet.contains("aten.nll_loss_backward")) {
+      target.addIllegalOp<AtenNllLossBackwardOp>();
+      patterns.add<ConvertAtenNllLossBackwardOp>(typeConverter, context);
+    }
+    if (validCustomCallOpsSet.contains("aten.gelu")) {
+      target.addIllegalOp<AtenGeluOp>();
+      patterns.add<ConvertAtenGeluOp>(typeConverter, context);
+    }
+    if (validCustomCallOpsSet.contains("aten.argmax")) {
+      target.addIllegalOp<AtenArgmaxOp>();
+      patterns.add<ConvertAtenArgmaxOp>(typeConverter, context);
+    }
+    if (validCustomCallOpsSet.contains("aten.max.dim")) {
+      target.addIllegalOp<AtenMaxDimOp>();
+      target.addDynamicallyLegalOp<AtenMaxDimOp>(
+          [](AtenMaxDimOp op) { return op.getIndices().use_empty(); });
+      patterns.add<ConvertAtenMaxDimOp>(typeConverter, context);
+    }
+    if (validCustomCallOpsSet.contains("aten.one_hot")) {
+      target.addIllegalOp<AtenOneHotOp>();
+      patterns.add<ConvertAtenOneHotOp>(typeConverter, context);
+    }
+    if (validCustomCallOpsSet.contains("aten.topk")) {
+      target.addIllegalOp<AtenTopkOp>();
+      patterns.add<ConvertAtenTopkOp>(typeConverter, context);
+    }
+
+    target.addIllegalOp<AtenNonzeroOp>();
+    patterns.add<ConvertAtenNonzeroOp>(typeConverter, context);
+
     target.addIllegalOp<CustomOp>();
     patterns.add<ConvertDynamicPartitionCustomOp>(typeConverter, context);
     patterns.add<ConvertDynamicStitchCustomOp>(typeConverter, context);
     patterns.add<ConvertDynamicMaskStitchCustomOp>(typeConverter, context);
+
+    target.addIllegalOp<OperatorOp>();
+    patterns.add<ConvertFlashAttnFwdOp>(typeConverter, context);
+    patterns.add<ConvertFlashAttnBwdOp>(typeConverter, context);
+    patterns.add<ConvertFlashAttnKVCacheOp>(typeConverter, context);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns)))) {
       return signalPassFailure();
     }
   }
+
+private:
+  llvm::StringSet<> validCustomCallOpsSet;
 };
 } // namespace
 
 std::unique_ptr<OperationPass<func::FuncOp>>
-mlir::createConvertTorchToCustomCall() {
-  return std::make_unique<ConvertTorchToCustomCall>();
+mlir::createConvertTorchToCustomCall(ArrayRef<std::string> validCustomCallOps) {
+  return std::make_unique<ConvertTorchToCustomCall>(validCustomCallOps);
 }

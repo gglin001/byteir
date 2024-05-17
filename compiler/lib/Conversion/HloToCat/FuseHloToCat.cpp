@@ -229,7 +229,8 @@ struct ConvertTransposeReshapeBmmRrrToBmmRcr
   }
 };
 
-struct ConvertBmmRrrReshapeTransposeToBmmRrc
+template <typename SrcBmmType, typename DstBmmType>
+struct ConvertBmmReshapeTransposeToBmmReshape
     : public OpRewritePattern<mhlo::TransposeOp> {
   using OpRewritePattern<mhlo::TransposeOp>::OpRewritePattern;
 
@@ -239,8 +240,8 @@ struct ConvertBmmRrrReshapeTransposeToBmmRrc
     if (!reshapeOp || !reshapeOp.getResult().hasOneUse()) {
       return failure();
     }
-    auto bmmrrrOp = reshapeOp.getOperand().getDefiningOp<cat::BMMRRROp>();
-    if (!bmmrrrOp || !bmmrrrOp.getResult().hasOneUse()) {
+    auto srcBmmOp = reshapeOp.getOperand().getDefiningOp<SrcBmmType>();
+    if (!srcBmmOp || !srcBmmOp.getResult().hasOneUse()) {
       return failure();
     }
     SmallVector<int64_t> permutation;
@@ -266,18 +267,60 @@ struct ConvertBmmRrrReshapeTransposeToBmmRrc
       return failure();
     }
 
-    auto bmmrrrOpType = bmmrrrOp.getType().cast<ShapedType>();
-    // build bmm_rrc op
-    RankedTensorType bmmrrcResultType = RankedTensorType::get(
-        {bmmrrrOpType.getDimSize(0), bmmrrrOpType.getDimSize(2),
-         bmmrrrOpType.getDimSize(1)},
-        bmmrrrOpType.getElementType());
-    auto bmmrrcOp = rewriter.create<cat::BMMRRCOp>(
-        op.getLoc(), bmmrrcResultType, bmmrrrOp.getLhs(), bmmrrrOp.getRhs());
+    auto srcBmmOpType = srcBmmOp.getType().template cast<ShapedType>();
+    // build dst bmm op
+    RankedTensorType dstBmmOpResultType = RankedTensorType::get(
+        {srcBmmOpType.getDimSize(0), srcBmmOpType.getDimSize(2),
+         srcBmmOpType.getDimSize(1)},
+        srcBmmOpType.getElementType());
+    auto dstBmmOp = rewriter.create<DstBmmType>(
+        op.getLoc(), dstBmmOpResultType, srcBmmOp.getLhs(), srcBmmOp.getRhs());
     // build new reshape op
     auto newShapeOp = rewriter.create<mhlo::ReshapeOp>(
-        op.getLoc(), op.getType(), bmmrrcOp.getResult());
+        op.getLoc(), op.getType(), dstBmmOp.getResult());
     rewriter.replaceOp(op, newShapeOp.getResult());
+    return success();
+  }
+};
+
+// bmm_rrr(x, broadcast_in_dim(y)) => reshape(gemm_rrr(reshape(x), y))
+struct ConvertBmmRRRBroadcastToReshapeGemmRRRReshape
+    : public OpRewritePattern<cat::BMMRRROp> {
+  using OpRewritePattern<cat::BMMRRROp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(cat::BMMRRROp op,
+                                PatternRewriter &rewriter) const override {
+    auto bCastOp = op.getRhs().getDefiningOp<mhlo::BroadcastInDimOp>();
+    if (!bCastOp) {
+      return failure();
+    }
+    auto lhsType = op.getLhs().getType().cast<ShapedType>();
+    auto rhsType = op.getRhs().getType().cast<ShapedType>();
+    if (!lhsType.hasStaticShape() || !rhsType.hasStaticShape()) {
+      return failure();
+    }
+    SmallVector<int64_t> broadcastDimensions;
+    getValuesFromDenseIntElementsAttr(bCastOp.getBroadcastDimensions(),
+                                      broadcastDimensions);
+    if (broadcastDimensions.size() != 2) {
+      return failure();
+    }
+    if (broadcastDimensions[0] != 1 || broadcastDimensions[1] != 2) {
+      return failure();
+    }
+
+    RankedTensorType firstReshapeType = RankedTensorType::get(
+        {lhsType.getDimSize(0) * lhsType.getDimSize(1), lhsType.getDimSize(2)},
+        lhsType.getElementType());
+    RankedTensorType gemmType = RankedTensorType::get(
+        {firstReshapeType.getDimSize(0), rhsType.getDimSize(2)},
+        lhsType.getElementType());
+    auto firstReshape = rewriter.create<mhlo::ReshapeOp>(
+        op.getLoc(), firstReshapeType, op.getLhs());
+    auto gemm = rewriter.create<cat::GemmRRROp>(
+        op.getLoc(), gemmType, firstReshape, bCastOp.getOperand());
+    auto secondReshape =
+        rewriter.create<mhlo::ReshapeOp>(op.getLoc(), op.getType(), gemm);
+    rewriter.replaceOp(op, secondReshape);
     return success();
   }
 };
@@ -309,7 +352,16 @@ void populateFuseMhloToCatPattern(RewritePatternSet &patterns) {
                ConvertLayerNorm,
                ConvertTransposeGemmRrrToBmmCrr,
                ConvertTransposeReshapeBmmRrrToBmmRcr,
-               ConvertBmmRrrReshapeTransposeToBmmRrc>(patterns.getContext());
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMRRROp, cat::BMMRRCOp>,
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMRCROp, cat::BMMRCCOp>,
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMCRROp, cat::BMMCRCOp>,
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMCCROp, cat::BMMCCCOp>,
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMRRCOp, cat::BMMRRROp>,
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMRCCOp, cat::BMMRCROp>,
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMCRCOp, cat::BMMCRROp>,
+               ConvertBmmReshapeTransposeToBmmReshape<cat::BMMCCCOp, cat::BMMCCROp>,
+               ConvertBmmRRRBroadcastToReshapeGemmRRRReshape
+               >(patterns.getContext());
   // clang-format on
 }
 

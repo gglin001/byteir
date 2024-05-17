@@ -15,6 +15,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "bindings/c/Passes.h"
 #include "byteir-c/Dialects.h"
 #include "byteir-c/Passes.h"
 #include "byteir-c/Translation.h"
@@ -30,9 +31,11 @@ static MlirStringRef toMlirStringRef(const std::string &s) {
 
 PYBIND11_MODULE(_byteir, m) {
   byteirRegisterAllPasses();
+  mlirRegisterAllMhloPasses();
 
   m.doc() = "byteir python extension";
 
+  //========== Register Dialects ============
   m.def(
       "register_cat_dialect",
       [](MlirContext context, bool load) {
@@ -43,22 +46,126 @@ PYBIND11_MODULE(_byteir, m) {
         }
       },
       py::arg("context"), py::arg("load") = true);
+  m.def(
+      "register_ace_dialect",
+      [](MlirContext context, bool load) {
+        MlirDialectHandle handle = mlirGetDialectHandle__ace__();
+        mlirDialectHandleRegisterDialect(handle, context);
+        if (load) {
+          mlirDialectHandleLoadDialect(handle, context);
+        }
+      },
+      py::arg("context"), py::arg("load") = true);
+  m.def(
+      "register_ccl_dialect",
+      [](MlirContext context, bool load) {
+        MlirDialectHandle handle = mlirGetDialectHandle__ccl__();
+        mlirDialectHandleRegisterDialect(handle, context);
+        if (load) {
+          mlirDialectHandleLoadDialect(handle, context);
+        }
+      },
+      py::arg("context"), py::arg("load") = true);
+  m.def(
+      "register_byre_dialect",
+      [](MlirContext context, bool load) {
+        MlirDialectHandle handle = mlirGetDialectHandle__byre__();
+        mlirDialectHandleRegisterDialect(handle, context);
+        if (load) {
+          mlirDialectHandleLoadDialect(handle, context);
+        }
+      },
+      py::arg("context"), py::arg("load") = true);
+  m.def(
+      "register_byre_serial_dialect",
+      [](MlirContext context, bool load) {
+        MlirDialectHandle handle = mlirGetDialectHandle__byre_serial__();
+        mlirDialectHandleRegisterDialect(handle, context);
+        if (load) {
+          mlirDialectHandleLoadDialect(handle, context);
+        }
+      },
+      py::arg("context"), py::arg("load") = true);
 
-  m.def("register_dialect_extensions", &byteirRegisterDialectExtensions,
-        py::arg("context"));
+  m.def(
+      "register_dialect_extensions",
+      [](MlirContext context) { byteirRegisterDialectExtensions(context); },
+      py::arg("context"));
 
   m.def(
       "register_translation_dialects",
       [](MlirContext context) { byteirRegisterTranslationDialects(context); },
       py::arg("context"));
 
+  //============ Translate ==============
   m.def(
       "translate_to_ptx",
-      [](MlirOperation module, const std::string &ptx_prefix_file_name,
-         const std::string &gpu_arch) {
-        byteirTranslateToPTX(module, toMlirStringRef(ptx_prefix_file_name),
-                             toMlirStringRef(gpu_arch));
+      [](MlirModule module, const std::string &ptxPrefixFileName,
+         const std::string &gpuArch) {
+        if (!byteirTranslateToPTX(module, toMlirStringRef(ptxPrefixFileName),
+                                  toMlirStringRef(gpuArch))) {
+          PyErr_SetString(PyExc_ValueError, "failed to translate to ptx");
+          return;
+        }
+        return;
       },
       py::arg("module"), py::arg("ptx_prefix_file_name"),
       py::arg("gpu_arch") = "sm_70");
+  m.def(
+      "translate_to_llvmbc",
+      [](MlirModule module, const std::string &outputFile) {
+        if (!byteirTranslateToLLVMBC(module, toMlirStringRef(outputFile))) {
+          PyErr_SetString(PyExc_ValueError,
+                          "failed to translate to llvm bytecode");
+          return;
+        }
+        return;
+      },
+      py::arg("module"), py::arg("output_file"));
+  m.def(
+      "translate_to_llvmir",
+      [](MlirModule module, const std::string &outputFile) {
+        if (!byteirTranslateToLLVMIR(module, toMlirStringRef(outputFile))) {
+          PyErr_SetString(PyExc_ValueError, "failed to translate to llvm ir");
+          return;
+        }
+        return;
+      },
+      py::arg("module"), py::arg("output_file"));
+
+  //============ Byre Serialization ==============
+  m.def(
+      "serialize_byre",
+      [](MlirModule module, const std::string &targetVersion,
+         const std::string &outputFile) {
+        if (!byteirSerializeByre(module, toMlirStringRef(targetVersion),
+                                 toMlirStringRef(outputFile))) {
+          PyErr_SetString(PyExc_ValueError, "failed to serialize byre");
+          return;
+        }
+        return;
+      },
+      py::arg("module"), py::arg("target_version"), py::arg("output_file"));
+  m.def("deserialize_byre",
+        [](const std::string &artifactStr, MlirContext context) -> MlirModule {
+          auto module =
+              byteirDeserializeByre(toMlirStringRef(artifactStr), context);
+          if (mlirModuleIsNull(module)) {
+            PyErr_SetString(PyExc_ValueError, "failed to deserialize byre");
+          }
+          return module;
+        });
+
+  //============ Module Utils ==============
+  m.def(
+      "merge_two_modules",
+      [](MlirModule module0, MlirModule module1) -> MlirModule {
+        auto module = byteirMergeTwoModules(module0, module1);
+        if (mlirModuleIsNull(module)) {
+          PyErr_SetString(PyExc_ValueError, "failed to merge two modules");
+          return {};
+        }
+        return module;
+      },
+      py::arg("module0"), py::arg("module1"));
 }

@@ -40,26 +40,52 @@ common::Status FillOpKernel::RunImpl(const ExecutionContext &ctx) {
       static_cast<CUDAWorkQueue *>(ctx.work_queue)->GetComputeStream();
   void *device_p = accessor.GetArgAsyncValueRef(0);
   size_t length = accessor.GetNumElementsOfShape(accessor.GetArgShape(0));
+
   // TODO: common helper for dtype dispatch
 #define CASE(dtype, ctype, mlir_type)                                          \
-  case DTypeEnum::dtype:                                                       \
-    kernel::Fill(                                                              \
-        stream, static_cast<ctype *>(device_p),                                \
-        static_cast<ctype>(accessor.GetAttrAsSplatValue<mlir_type>("value")),  \
-        length);                                                               \
-    return common::Status::OK()
+  case DTypeEnum::dtype: {                                                     \
+    if (accessor.HasAttrOfSplatValue<mlir_type>("value")) {                    \
+      kernel::Fill(stream, static_cast<ctype *>(device_p),                     \
+                   static_cast<ctype>(                                         \
+                       accessor.GetAttrAsSplatValue<mlir_type>("value")),      \
+                   length);                                                    \
+      return common::Status::OK();                                             \
+    }                                                                          \
+    break;                                                                     \
+  }
+
   switch (dtype) {
-    CASE(Float32, float, float);
+    CASE(Float32, float, double);
     CASE(Int64, int64_t, int64_t);
     CASE(Float64, double, double);
-    CASE(Float16, __half, float);
+    CASE(Float16, __half, double);
+    CASE(Bool, int8_t, int64_t);
 #undef CASE
   default:
-    return common::Status(common::StatusCategory::BRT,
-                          common::StatusCode::NOT_IMPLEMENTED,
-                          "not supported dtype");
+    break;
   };
-  return common::Status::OK();
+
+#define CASE(dtype, ctype)                                                     \
+  case DTypeEnum::dtype: {                                                     \
+    std::vector<ctype> value = accessor.GetAttrAsVector<ctype>("value");       \
+    cudaMemcpyAsync(device_p, value.data(), value.size() * sizeof(ctype),      \
+                    cudaMemcpyHostToDevice, stream);                           \
+    return common::Status::OK();                                               \
+  }
+
+  switch (dtype) {
+    CASE(Float32, float);
+    CASE(Int64, int64_t);
+    CASE(Float64, double);
+    CASE(Float16, half_float::half);
+#undef CASE
+  default:
+    break;
+  };
+
+  return common::Status(common::StatusCategory::BRT,
+                        common::StatusCode::NOT_IMPLEMENTED,
+                        "not supported FillOp");
 }
 
 common::Status FillOpKernel::ProloguePerFrame(const ExecutionContext &) {

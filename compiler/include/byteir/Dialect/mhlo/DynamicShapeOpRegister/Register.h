@@ -33,8 +33,11 @@ void registerDynamicReshapeInferReturnTypeComponents();
 void registerRealDynamicSliceInferReturnTypeComponents();
 void registerReduceInferReturnTypeComponents();
 void registerSoftmaxInferReturnTypeComponents();
+void registerAddNInferReturnTypeComponents();
 void registerTorchIndexSelectInferReturnTypeComponents();
 void registerGeLUInferReturnTypeComponents();
+void registerLayerNormInferReturnTypeComponents();
+void registerBatchMatMulInferReturnTypeComponents();
 
 inline void registerAllMhloInferReturnTypeComponents() {
   registerConvolutionInferReturnTypeComponents();
@@ -45,8 +48,11 @@ inline void registerAllMhloInferReturnTypeComponents() {
   registerRealDynamicSliceInferReturnTypeComponents();
   registerReduceInferReturnTypeComponents();
   registerSoftmaxInferReturnTypeComponents();
+  registerAddNInferReturnTypeComponents();
   registerTorchIndexSelectInferReturnTypeComponents();
   registerGeLUInferReturnTypeComponents();
+  registerLayerNormInferReturnTypeComponents();
+  registerBatchMatMulInferReturnTypeComponents();
 }
 
 //===----------------------------------------------------------------------===//
@@ -55,11 +61,17 @@ inline void registerAllMhloInferReturnTypeComponents() {
 void registerDynamicPartitionInferBoundedReturnTypeComponents();
 void registerNonZeroInferBoundedReturnTypeComponents();
 void registerWhereInferBoundedReturnTypeComponents();
+void registerScatterNdInferBoundedReturnTypeComponents();
+void registerStridedSliceInferBoundedReturnTypeComponents();
+void registerRepeatInferBoundedReturnTypeComponents();
 
 inline void registerAllMhloInferBoundedReturnTypeComponents() {
   registerDynamicPartitionInferBoundedReturnTypeComponents();
   registerNonZeroInferBoundedReturnTypeComponents();
   registerWhereInferBoundedReturnTypeComponents();
+  registerScatterNdInferBoundedReturnTypeComponents();
+  registerStridedSliceInferBoundedReturnTypeComponents();
+  registerRepeatInferBoundedReturnTypeComponents();
 }
 
 //===----------------------------------------------------------------------===//

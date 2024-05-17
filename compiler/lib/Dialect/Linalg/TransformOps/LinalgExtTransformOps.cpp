@@ -56,6 +56,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/TilingInterface.h"
 #include "mlir/Transforms/InliningUtils.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -63,6 +64,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
+
 #include <numeric>
 
 using namespace mlir;
@@ -129,8 +131,8 @@ transform::CollapseDimsOp::apply(transform::TransformRewriter &rewriter,
     SimpleRewriter rewriter(getContext());
     rewriter.setInsertionPoint(target);
     std::optional<SmallVector<Value>> replacements =
-        collapseGenericOpIterationDims(genericOp, getReassociationIndices(),
-                                       rewriter);
+        collapseOpIterationDims<linalg::GenericOp>(
+            genericOp, getReassociationIndices(), rewriter);
     if (!replacements)
       return emitDefaultDefiniteFailure(target) << " failed to collapsed dims";
 
@@ -147,6 +149,76 @@ transform::CollapseDimsOp::apply(transform::TransformRewriter &rewriter,
     collapsed.push_back(definingOp);
   }
   results.set(getTransformed().cast<OpResult>(), collapsed);
+  return DiagnosedSilenceableFailure::success();
+}
+
+//===----------------------------------------------------------------------===//
+// DetensorizeOp
+//===----------------------------------------------------------------------===//
+namespace {
+LogicalResult detensorizeLinalgOp(OpBuilder &b, linalg::LinalgOp linalgOp) {
+  if (!linalgOp.hasTensorSemantics())
+    return failure();
+
+  if (linalgOp.getNumLoops())
+    return failure();
+
+  Location loc = linalgOp->getLoc();
+  SmallVector<Value> scalars;
+  scalars.reserve(linalgOp->getNumOperands());
+  for (auto &&operand : linalgOp->getOpOperands()) {
+    if (!linalgOp.payloadUsesValueFromOperand(&operand)) {
+      scalars.push_back(nullptr);
+      continue;
+    }
+    if (linalgOp.isScalar(&operand)) {
+      scalars.push_back(operand.get());
+      continue;
+    }
+    auto tensorType = llvm::dyn_cast<TensorType>(operand.get().getType());
+    if (!tensorType || !tensorType.hasRank() || tensorType.getRank() != 0)
+      return failure();
+
+    scalars.push_back(
+        b.create<tensor::ExtractOp>(loc, operand.get(), ValueRange()));
+  }
+
+  Block *body = linalgOp.getBlock();
+  IRMapping map;
+  map.map(body->getArguments(), scalars);
+  for (auto &&op : body->without_terminator()) {
+    b.clone(op, map);
+  }
+
+  for (OpOperand &opOperand : linalgOp.getDpsInitsMutable()) {
+    OpOperand *yieldOperand = linalgOp.getMatchingYieldValue(&opOperand);
+    Value element = map.lookupOrDefault(yieldOperand->get());
+    Value tensor = b.create<tensor::FromElementsOp>(
+        loc, RankedTensorType::get({}, element.getType()), ValueRange(element));
+    Value result = linalgOp.getTiedOpResult(&opOperand);
+    result.replaceAllUsesWith(tensor);
+  }
+  linalgOp->erase();
+  return success();
+}
+} // namespace
+
+DiagnosedSilenceableFailure
+transform::DetensorizeOp::apply(transform::TransformRewriter &rewriter,
+                                transform::TransformResults &results,
+                                transform::TransformState &state) {
+  for (Operation *target : state.getPayloadOps(getTarget())) {
+    auto linalgOp = dyn_cast_or_null<linalg::LinalgOp>(target);
+    if (!linalgOp)
+      return emitDefaultDefiniteFailure(target)
+             << " detensorize transformation should be applied on linalg op";
+
+    OpBuilder builder(getContext());
+    builder.setInsertionPoint(target);
+    if (failed(detensorizeLinalgOp(builder, linalgOp)))
+      return emitDefaultDefiniteFailure(linalgOp)
+             << " failed to detensorize op";
+  }
   return DiagnosedSilenceableFailure::success();
 }
 
@@ -371,6 +443,8 @@ static LogicalResult applyTilingToAll(
   FrozenRewritePatternSet frozenPatterns(std::move(patterns));
 
   for (Operation *target : targetPayloadOps) {
+    LLVM_DEBUG(DBGS() << "Fuse target: " << *target << "\n");
+
     auto funcOp = target->getParentOfType<func::FuncOp>();
 
     // simplify tensor::DimOp
@@ -516,7 +590,8 @@ transform::FuseExtOp::apply(mlir::transform::TransformRewriter &rewriter,
 
   scf::SCFTilingOptions tilingOptions;
   tilingOptions.interchangeVector = tileInterchange;
-  tilingOptions = tilingOptions.setTileSizes(tileSizes);
+  tilingOptions = tilingOptions.setTileSizes(
+      getAsIndexOpFoldResult(rewriter.getContext(), tileSizes));
   scf::SCFTileAndFuseOptions tileAndFuseOptions;
   tileAndFuseOptions.tilingOptions = tilingOptions;
   SmallVector<Operation *> targetOps =
@@ -944,22 +1019,23 @@ transform::TileExtOp::apply(TransformRewriter &rewriter,
     scf::SCFTilingOptions tilingOptions;
     unsigned index = en.index();
     if (!tileSizes.empty()) {
-      tilingOptions.setTileSizeComputationFunction(
-          [&, index](OpBuilder &b, Operation *) {
-            SmallVector<Value, 4> sizes;
-            sizes.reserve(tileSizes.size());
-            unsigned dynamicIdx = 0;
-            for (OpFoldResult ofr : getMixedSizes()) {
-              if (auto attr = ofr.dyn_cast<Attribute>()) {
-                sizes.push_back(b.create<arith::ConstantIndexOp>(
-                    getLoc(), attr.cast<IntegerAttr>().getInt()));
-              } else {
-                sizes.push_back(
-                    dynamicSizeProducers[dynamicIdx++][index]->getResult(0));
-              }
-            }
-            return sizes;
-          });
+      tilingOptions.setTileSizeComputationFunction([&, index](OpBuilder &b,
+                                                              Operation *) {
+        SmallVector<OpFoldResult, 4> sizes;
+        sizes.reserve(tileSizes.size());
+        unsigned dynamicIdx = 0;
+        for (OpFoldResult ofr : getMixedSizes()) {
+          if (auto attr = ofr.dyn_cast<Attribute>()) {
+            sizes.push_back(b.create<arith::ConstantIndexOp>(
+                                 getLoc(), attr.cast<IntegerAttr>().getInt())
+                                .getResult());
+          } else {
+            sizes.push_back(
+                dynamicSizeProducers[dynamicIdx++][index]->getResult(0));
+          }
+        }
+        return sizes;
+      });
     }
 
     tilingOptions.setInterchange(getInterchange());
@@ -1057,26 +1133,25 @@ StringAttr getAllReduceType(linalg::GenericOp mergeOp, linalg::FillOp initOp) {
   StringAttr reduceType;
   MLIRContext *ctx = mergeOp.getContext();
   Block *block = &mergeOp.getRegion().front();
-  if (isBlockSingleOp<arith::AddFOp>(block) ||
-      isBlockSingleOp<arith::AddIOp>(block))
+  if (isBlockSingleOp<arith::AddFOp, arith::AddIOp>(block))
     reduceType = StringAttr::get(ctx, ccl::getRedOpSumName());
-  else if (isBlockSingleOp<arith::MaxFOp>(block) ||
-           isBlockSingleOp<arith::MaxSIOp>(block) ||
-           isBlockSingleOp<arith::MaxUIOp>(block))
+  else if (isBlockSingleOp<arith::MaximumFOp, arith::MaxNumFOp, arith::MaxSIOp,
+                           arith::MaxUIOp>(block))
     reduceType = StringAttr::get(ctx, ccl::getRedOpMaxName());
-  else if (isBlockSingleOp<arith::MinFOp>(block) ||
-           isBlockSingleOp<arith::MinSIOp>(block) ||
-           isBlockSingleOp<arith::MinUIOp>(block))
+  else if (isBlockSingleOp<arith::MinimumFOp, arith::MinNumFOp, arith::MinSIOp,
+                           arith::MinUIOp>(block))
     reduceType = StringAttr::get(ctx, ccl::getRedOpMinName());
   // TODO: support avg / prod all-reduce type
   else {
-    DBGS() << "operations in the block can't match any reduce type\n";
+    LLVM_DEBUG(
+        DBGS() << "operations in the block can't match any reduce type\n");
     return nullptr;
   }
 
   auto constOp = initOp.getInputs()[0].getDefiningOp<arith::ConstantOp>();
   if (!constOp) {
-    DBGS() << "fill op's input is expected to be type of arith.constant\n";
+    LLVM_DEBUG(
+        DBGS() << "fill op's input is expected to be type of arith.constant\n");
     return nullptr;
   }
 
@@ -1274,7 +1349,8 @@ DiagnosedSilenceableFailure transform::SharedOutputToDistributedStyleOp::apply(
     parallelBlock->clear();
     builder.setInsertionPointAfterValue(retVal);
     auto allReduceOp = builder.create<ccl::AllReduceOp>(
-        retVal.getLoc(), retVal, /*dynamic_replica_groups*/ nullptr, reduceType,
+        retVal.getLoc(), retVal, /*dynamic_replica_groups*/ nullptr,
+        /*synchronous*/ rewriter.getBoolAttr(true), reduceType,
         /*replica_groups*/ replicaGroupAttrs, /*unique_id*/ nullptr);
 
     // create new merge op
@@ -1496,6 +1572,66 @@ LogicalResult transform::FuseOperandsOp::verify() {
                          << getTileInterchange();
   }
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// InsertSliceToCopyExtOp
+//===----------------------------------------------------------------------===//
+template <typename OpTy>
+DiagnosedSilenceableFailure
+insertSliceToCopyImpl(RewriterBase &rewriter, OpTy target,
+                      transform::ApplyToEachResultList &results,
+                      transform::TransformState &state) {
+  static_assert(llvm::is_one_of<OpTy, tensor::InsertSliceOp,
+                                tensor::ParallelInsertSliceOp>() &&
+                "wrong op type");
+
+  if (auto copySource =
+          target.getSource().template getDefiningOp<linalg::CopyOp>()) {
+    results.push_back(copySource);
+    return DiagnosedSilenceableFailure::success();
+  }
+
+  // If we are inside an InParallel region, temporarily set the insertion point
+  // outside: only tensor.parallel_insert_slice ops are allowed in there.
+  if constexpr (std::is_same_v<OpTy, tensor::ParallelInsertSliceOp>) {
+    rewriter.setInsertionPoint(
+        target->template getParentOfType<scf::InParallelOp>());
+  }
+
+  Value extracted = rewriter.create<tensor::ExtractSliceOp>(
+      target.getLoc(), target.getSourceType(), target.getDest(),
+      target.getMixedOffsets(), target.getMixedSizes(),
+      target.getMixedStrides());
+  Value copied = rewriter
+                     .create<linalg::CopyOp>(target.getLoc(),
+                                             target.getSource(), extracted)
+                     .getResult(0);
+  // Reset the insertion point.
+  rewriter.setInsertionPoint(target);
+  rewriter.replaceOpWithNewOp<OpTy>(
+      target, copied, target.getDest(), target.getMixedOffsets(),
+      target.getMixedSizes(), target.getMixedStrides());
+
+  results.push_back(copied.getDefiningOp());
+  return DiagnosedSilenceableFailure::success();
+}
+
+DiagnosedSilenceableFailure transform::InsertSliceToCopyExtOp::applyToOne(
+    transform::TransformRewriter &rewriter, Operation *targetOp,
+    transform::ApplyToEachResultList &results,
+    transform::TransformState &state) {
+  rewriter.setInsertionPoint(targetOp);
+  if (auto target = dyn_cast<tensor::InsertSliceOp>(targetOp))
+    return insertSliceToCopyImpl(rewriter, target, results, state);
+  if (auto target = dyn_cast<tensor::ParallelInsertSliceOp>(targetOp))
+    return insertSliceToCopyImpl(rewriter, target, results, state);
+
+  DiagnosedSilenceableFailure diag =
+      emitSilenceableError()
+      << "only InsertSliceOp and ParallelInsertSliceOp ops are supported";
+  diag.attachNote(targetOp->getLoc()) << "target op";
+  return diag;
 }
 
 //===----------------------------------------------------------------------===//

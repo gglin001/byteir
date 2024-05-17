@@ -10,7 +10,7 @@ add_mlir_library(TorchFrontendPipelines
     MLIRIR
     TorchMLIRTorchToStablehlo
     TorchMLIRTorchConversionPasses
-    StablehloToMhlo
     TorchFrontendConversion
     TorchFrontendTransforms
+    StablehloPasses
 )

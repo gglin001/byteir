@@ -27,6 +27,7 @@ def CustomizedTfToMhloPipeline : Pass<"customized-tf-to-mhlo", "mlir::ModuleOp">
     "mlir::TF::TensorFlowDialect",
     "mlir::mhlo::MhloDialect",
     "mlir::chlo::ChloDialect",
+    "mlir::stablehlo::StablehloDialect",
     "mlir::shape::ShapeDialect",
     "mlir::ace::AceDialect",
   ];
@@ -39,8 +40,14 @@ def CustomizedTfToMhloPipeline : Pass<"customized-tf-to-mhlo", "mlir::ModuleOp">
     Option<"staticalizeDynamicShape", "staticalize-dynamic-shape", "bool",
           /*default*/"false", "Aggresively and experimentally try to rewrite "
           "the dynamic graph to a equivalent static graph">,
+    Option<"stopAfterConvertToTfDialect", "stop-after-convert-to-tf-dialect", "bool", /*default=*/"false",
+           "stop after convert to tf dialect">,
     Option<"stopAfterRewriteCustomCall", "stop-after-rewrite-customcall", "bool", /*default=*/"false",
-           "stop after rewrite customcall ops">
+           "stop after rewrite customcall ops">,
+    Option<"setAssumingToBeTrue", "set-assuming-to-be-true", "bool", /*default=*/"true",
+           "remove cstr_reshapable,cstr_broadcastable, and set assuming to be true">,
+    Option<"repeatOutBatchSize", "repeat-out-batch-size", "int64_t", /*default=*/"-1",
+           "batch size of repeat output tensor">
   ];
 }
 

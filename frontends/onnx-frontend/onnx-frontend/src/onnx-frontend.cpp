@@ -15,12 +15,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mhlo/IR/hlo_ops.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/InitAllDialects.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/Timing.h"
+#include "stablehlo/dialect/StablehloOps.h"
 
 #include "third_party/onnx-mlir/src/Compiler/CompilerOptions.hpp"
 #include "third_party/onnx-mlir/src/Compiler/CompilerUtils.hpp"
@@ -37,41 +37,36 @@ int main(int argc, char *argv[]) {
   context.getOrLoadDialect<mlir::func::FuncDialect>();
   context.getOrLoadDialect<mlir::shape::ShapeDialect>();
   context.getOrLoadDialect<mlir::ONNXDialect>();
-  context.getOrLoadDialect<mlir::mhlo::MhloDialect>();
-
-  llvm::cl::opt<std::string> inputFilename(
-      llvm::cl::Positional, llvm::cl::desc("<input file>"), llvm::cl::init("-"),
-      llvm::cl::cat(onnx_frontend::OnnxFrontendOptions));
-
-  llvm::cl::opt<std::string> outputFilename(
-      "o", llvm::cl::desc("Output filename"), llvm::cl::value_desc("filename"),
-      llvm::cl::init("-"), llvm::cl::cat(onnx_frontend::OnnxFrontendOptions));
+  context.getOrLoadDialect<mlir::stablehlo::StablehloDialect>();
 
   // Register MLIR command line options.
   mlir::registerAsmPrinterCLOptions();
   mlir::registerMLIRContextCLOptions();
   mlir::registerPassManagerCLOptions();
   mlir::registerDefaultTimingManagerCLOptions();
-  llvm::cl::HideUnrelatedOptions({&onnx_frontend::OnnxFrontendOptions,
-                                  &onnx_mlir::OnnxMlirOptions,
-                                  &(llvm::cl::getGeneralCategory())});
+  llvm::cl::HideUnrelatedOptions(
+      {&onnx_frontend::OnnxFrontendOptions, &onnx_mlir::OnnxMlirOptions,
+       &onnx_mlir::OnnxMlirCommonOptions, &(llvm::cl::getGeneralCategory())});
 
   // Parse options from argc/argv
   llvm::cl::ParseCommandLineOptions(argc, argv, "ONNX-Frontend\n");
 
   onnx_frontend::EmissionTargetType emissionTarget;
   bool emitElide = false;
-  if (outputFilename == "-") {
-    emissionTarget = onnx_frontend::EmitMhloIR;
-  } else if (onnx_frontend::EndsWith(outputFilename, ".onnx.mlir")) {
+  if (onnx_mlir::outputBaseName == "-") {
+    emissionTarget = onnx_frontend::EmitStablehloIR;
+  } else if (onnx_frontend::EndsWith(onnx_mlir::outputBaseName, ".onnx.mlir")) {
     emissionTarget = onnx_frontend::EmitONNXIR;
-  } else if (onnx_frontend::EndsWith(outputFilename, ".onnx.elide.mlir")) {
+  } else if (onnx_frontend::EndsWith(onnx_mlir::outputBaseName,
+                                     ".onnx.elide.mlir")) {
     emissionTarget = onnx_frontend::EmitONNXIR;
     emitElide = true;
-  } else if (onnx_frontend::EndsWith(outputFilename, ".mhlo.mlir")) {
-    emissionTarget = onnx_frontend::EmitMhloIR;
-  } else if (onnx_frontend::EndsWith(outputFilename, ".mhlo.elide.mlir")) {
-    emissionTarget = onnx_frontend::EmitMhloIR;
+  } else if (onnx_frontend::EndsWith(onnx_mlir::outputBaseName,
+                                     ".stablehlo.mlir")) {
+    emissionTarget = onnx_frontend::EmitStablehloIR;
+  } else if (onnx_frontend::EndsWith(onnx_mlir::outputBaseName,
+                                     ".stablehlo.elide.mlir")) {
+    emissionTarget = onnx_frontend::EmitStablehloIR;
     emitElide = true;
   } else {
     std::cerr << "Invalid output extension name" << std::endl;
@@ -80,8 +75,8 @@ int main(int argc, char *argv[]) {
 
   mlir::OwningOpRef<mlir::ModuleOp> module;
   std::string errorMessage;
-  int rc = onnx_frontend::processInputFile(inputFilename, context, module,
-                                           &errorMessage);
+  int rc = onnx_frontend::processInputFile(onnx_mlir::inputFilename, context,
+                                           module, &errorMessage);
   if (rc != 0) {
     if (!errorMessage.empty())
       std::cerr << errorMessage << std::endl;
@@ -90,10 +85,12 @@ int main(int argc, char *argv[]) {
 
   mlir::PassManager pm(module.get()->getName(),
                        mlir::OpPassManager::Nesting::Implicit);
-  if (emissionTarget == onnx_frontend::EmitMhloIR) {
-    onnx_frontend::addCustomizedONNXToMhloPasses(pm,
-                                                 onnx_frontend::customCallOps);
+  if (emissionTarget == onnx_frontend::EmitStablehloIR) {
+    onnx_frontend::addCustomizedONNXToStablehloPasses(
+        pm, onnx_frontend::customCallOps, onnx_frontend::enableUnroll);
+    onnx_frontend::addVerifyONNXToStablehloPasses(pm);
   }
-  return onnx_frontend::compileModule(module, pm, outputFilename,
-                                      emissionTarget, emitElide);
+  auto status = onnx_frontend::compileModule(
+      module, pm, onnx_mlir::outputBaseName, emissionTarget, emitElide);
+  return status;
 }

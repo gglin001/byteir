@@ -19,7 +19,7 @@
 #define ONNX_FRONTEND_SRC_CONVERSION_OF_CUSTOM_CALL_TD
 
 include "src/Dialect/ONNX/ONNX.td"  // third_party/onnx-mlir/src/Dialect/ONNX/ONNX.td
-                 
+
 def IsOneSize : Constraint<CPred<"$0.size() == 1">, "is of size one">;
 def IsOneSizeElements : Constraint<And<[
     CPred<" $0 ">,
@@ -29,28 +29,59 @@ def TrueBoolAttr : Constraint<CPred<"$0.getValue() == true">, "this BoolAttr sho
 def SameTwoValuesOrAttrs : Constraint<CPred<"$0 == $1">, "two values or attrs are actually the same">;
 def HasOneUse : Constraint<CPred<"$0.hasOneUse()">, "value has exactly one use">;
 
+def isScalarConstantTensor :
+    Constraint<CPred<"onnx_mlir::isScalarConstantTensor($_self)">,
+  "Value is produced by a dense ONNXConstantOp and has size one">;
+def isNoneValue :
+    Constraint<CPred<"onnx_mlir::isNoneValue($_self)">,
+  "Value is None Value">;
+def SameTwoIntegerScalarConstantValues :
+    Constraint<CPred<"onnx_mlir::getElementAttributeFromONNXValue($0).getValues<APInt>()[0].getSExtValue() == onnx_mlir::getElementAttributeFromONNXValue($1).getValues<APInt>()[0].getSExtValue()">,
+  "Two integer scalar constant Value have the same integer scalar">;
+
 //===----------------------------------------------------------------------===//
 // L2Norm Pattern
 //===----------------------------------------------------------------------===//
-def RewriteL2Norm : Pat<
+def RewriteL2NormPat1 : Pat<
   (ONNXDivOp
     $input,
     (ONNXExpandOp
       (ONNXAddOp
-        (ONNXReduceL2V13Op $input, $axis_attr, $keep_dims),
+        (ONNXReduceL2Op $input, $axes, $keep_dims, $noop_with_empty_axes),
         (ONNXConstantOp $_, $epsilon_attr, $_, $_, $_, $_, $_, $_)
       ),
       (ONNXConstantOp $_, $_, $_, $_, $_, $_, $_, $_)  // should be the shape of $input
     )
   ),
-  (NativeCodeCall<"createL2Norm($_builder, $_loc, $0, $1, $2)"> $input, $axis_attr, $epsilon_attr),
-  [(IsOneSize $axis_attr), (TrueBoolAttr $keep_dims), (IsOneSizeElements $epsilon_attr)]>;
+  (NativeCodeCall<"createL2Norm($_builder, $_loc, $0, $1, $2)"> $input, $axes, $epsilon_attr),
+  [(isScalarConstantTensor:$axes), (TrueBoolAttr $keep_dims), (IsOneSizeElements $epsilon_attr)]>;
+
+def RewriteL2NormPat2 : Pat<
+  (ONNXDivOp
+    $input,
+    (ONNXReduceL2Op $input, $axes, $keep_dims, $noop_with_empty_axes)
+  ),
+  (NativeCodeCall<"createL2NormWithoutEps($_builder, $_loc, $0, $1)"> $input, $axes),
+  [(isScalarConstantTensor:$axes), (TrueBoolAttr $keep_dims)]>;
+
+def RewriteL2NormPat3 : Pat<
+  (ONNXDivOp
+    $input,
+    (ONNXExpandOp
+      (ONNXClipOp
+        (ONNXReduceL2Op $input, $axes, $keep_dims, $noop_with_empty_axes), $min, $max
+      ),
+      (ONNXConstantOp $_, $_, $_, $_, $_, $_, $_, $_)  // should be the shape of $input
+    )
+  ),
+  (NativeCodeCall<"createL2NormWithOutsideSqrtEps($_builder, $_loc, $0, $1, $2)"> $input, $axes, $min),
+  [(isScalarConstantTensor:$axes), (TrueBoolAttr $keep_dims), (isNoneValue:$max)]>;
 
 //===----------------------------------------------------------------------===//
 // Quantize/Dequantize Pattern
 //===----------------------------------------------------------------------===//
 def RewriteQuantize : Pat<
-  (ONNXQuantizeLinearOp:$output $input, $scale, $zero_point, $axis_attr),
+  (ONNXQuantizeLinearOp:$output $input, $scale, $zero_point, $axis_attr, $saturate),
   (NativeCodeCall<"createQuantizeDequantize<ONNXQuantizeLinearOp>($_builder, $_loc, $0, $1, $2, $3, $4)"> $input, $scale, $zero_point, $axis_attr, $output),
   []>;
 
@@ -97,15 +128,15 @@ def RewriteLayerNorm : Pat<
       (ONNXDivOp
         (ONNXSubOp:$input_zero_mean_0
           $input,
-          (ONNXReduceMeanV13Op $input, $axis_attr_0, $_)
+          (ONNXReduceMeanOp $input, $axes_0, $_, $_)
         ),
         (ONNXSqrtOp
           (ONNXAddOp
-            (ONNXReduceMeanV13Op
-              (ONNXPowOp
+            (ONNXReduceMeanOp
+              (ONNXMulOp
                 $input_zero_mean_1,
-                (ONNXConstantOp $_, $_, $_, $_, $_, $_, $_, $_)
-              ), $axis_attr_1, $_
+                $input_zero_mean_1
+              ), $axes_1, $_, $_
             ),
             (ONNXConstantOp $_, $epsilon_attr, $_, $_, $_, $_, $_, $_)
           )
@@ -115,10 +146,38 @@ def RewriteLayerNorm : Pat<
     ),
     (ONNXConstantOp:$B $_, $_, $_, $_, $_, $_, $_, $_)
   ),
-  (NativeCodeCall<"createLayerNorm($_builder, $_loc, $0, $1, $2, $3, $4)"> $input, $scale, $B, $axis_attr_1, $epsilon_attr),
+  (NativeCodeCall<"createLayerNorm($_builder, $_loc, $0, $1, $2, $3, $4)"> $input, $scale, $B, $axes_0, $epsilon_attr),
   [(IsOneSizeElements $epsilon_attr),
-   (IsOneSize $axis_attr_0), (IsOneSize $axis_attr_1),
-   (SameTwoValuesOrAttrs $axis_attr_0, $axis_attr_1),
+   (isScalarConstantTensor:$axes_0), (isScalarConstantTensor:$axes_1),
+   (SameTwoIntegerScalarConstantValues $axes_0, $axes_1),
+   (SameTwoValuesOrAttrs $input_zero_mean_0, $input_zero_mean_1),
+   (HasOneUse $mul_result),
+  ]>;
+
+def RewriteLayerNormWithNoneEps : Pat<
+  (ONNXAddOp
+    (ONNXMulOp:$mul_result
+      (ONNXDivOp
+        (ONNXSubOp:$input_zero_mean_0
+          $input,
+          (ONNXReduceMeanOp $input, $axes_0, $_, $_)
+        ),
+        (ONNXSqrtOp
+          (ONNXReduceMeanOp
+            (ONNXMulOp
+              $input_zero_mean_1,
+              $input_zero_mean_1
+            ), $axes_1, $_, $_
+          )
+        )
+      ),
+      (ONNXConstantOp:$scale $_, $_, $_, $_, $_, $_, $_, $_)
+    ),
+    (ONNXConstantOp:$B $_, $_, $_, $_, $_, $_, $_, $_)
+  ),
+  (NativeCodeCall<"createLayerNormWithNoneEps($_builder, $_loc, $0, $1, $2, $3)"> $input, $scale, $B, $axes_0),
+  [(isScalarConstantTensor:$axes_0), (isScalarConstantTensor:$axes_1),
+   (SameTwoIntegerScalarConstantValues $axes_0, $axes_1),
    (SameTwoValuesOrAttrs $input_zero_mean_0, $input_zero_mean_1),
    (HasOneUse $mul_result),
   ]>;
@@ -128,15 +187,15 @@ def RewriteLayerNormWithoutLastAdd : Pat<
     (ONNXDivOp
       (ONNXSubOp:$input_zero_mean_0
         $input,
-        (ONNXReduceMeanV13Op $input, $axis_attr_0, $_)
+        (ONNXReduceMeanOp $input, $axes_0, $_, $_)
       ),
       (ONNXSqrtOp
         (ONNXAddOp
-          (ONNXReduceMeanV13Op
-            (ONNXPowOp
+          (ONNXReduceMeanOp
+            (ONNXMulOp
               $input_zero_mean_1,
-              (ONNXConstantOp $_, $_, $_, $_, $_, $_, $_, $_)
-            ), $axis_attr_1, $_
+              $input_zero_mean_1
+            ), $axes_1, $_, $_
           ),
           (ONNXConstantOp $_, $epsilon_attr, $_, $_, $_, $_, $_, $_)
         )
@@ -144,10 +203,10 @@ def RewriteLayerNormWithoutLastAdd : Pat<
     ),
     (ONNXConstantOp:$scale $_, $_, $_, $_, $_, $_, $_, $_)
   ),
-  (NativeCodeCall<"createLayerNormWithoutLastAdd($_builder, $_loc, $0, $1, $2, $3)"> $input, $scale, $axis_attr_1, $epsilon_attr),
+  (NativeCodeCall<"createLayerNormWithoutLastAdd($_builder, $_loc, $0, $1, $2, $3)"> $input, $scale, $axes_0, $epsilon_attr),
   [(IsOneSizeElements $epsilon_attr),
-   (IsOneSize $axis_attr_0), (IsOneSize $axis_attr_1),
-   (SameTwoValuesOrAttrs $axis_attr_0, $axis_attr_1),
+   (isScalarConstantTensor:$axes_0), (isScalarConstantTensor:$axes_1),
+   (SameTwoIntegerScalarConstantValues $axes_0, $axes_1),
    (SameTwoValuesOrAttrs $input_zero_mean_0, $input_zero_mean_1),
   ]>;
 
@@ -157,6 +216,15 @@ def RewriteLayerNormWithoutLastAdd : Pat<
 def ValueSqrtTwo : Constraint<CPred<"isSplatFPCloseTo($0, std::sqrt(2))">, "value attr is not splat value of sqrt 2">;
 def ValueOne : Constraint<CPred<"isSplatFP($0, 1.0)">, "value attr is not splat value of 1.0">;
 def ValueHalf : Constraint<CPred<"isSplatFPCloseTo($0, 0.5)">, "value attr is not splat value of 0.5">;
+def IsTwoTimes : Constraint<Or<[
+  And<[
+    CPred< "$0.isa<SplatElementsAttr>()" >,
+    CPred< "$1.isa<SplatElementsAttr>()" >,
+    CPred< "isFPAttrTimesCloseTo($0.cast<SplatElementsAttr>(), $1.cast<SplatElementsAttr>(), 2.0)">]>,
+  And<[
+    CPred< "$0.isa<DenseElementsAttr>()" >,
+    CPred< "$1.isa<DenseElementsAttr>()" >,
+    CPred< "isFPAttrTimesCloseTo($0.cast<DenseElementsAttr>(), $1.cast<DenseElementsAttr>(), 2.0)">]>]>, "value attr $0 is not 2 times of $1">;
 
 def RewriteGeLU : Pat<
   (ONNXMulOp
@@ -196,5 +264,13 @@ def RewriteGeLUWithoutLastMul : Pat<
   [(IsOneSizeElements $sqrt_two), (IsOneSizeElements $one),
    (ValueSqrtTwo $sqrt_two), (ValueOne $one)
    ]>;
+
+//===----------------------------------------------------------------------===//
+// OneHot Pattern
+//===----------------------------------------------------------------------===//
+
+def RewriteOneHot : Pat<
+  (ONNXOneHotOp:$output $indices, $depth, $values, $axis),
+  (NativeCodeCall<"createOneHot($_builder, $_loc, $0, $1, $2, $3, $4)"> $indices, $depth, $values, $axis, $output)>;
 
 #endif // ONNX_FRONTEND_SRC_CONVERSION_OF_CUSTOM_CALL_TD

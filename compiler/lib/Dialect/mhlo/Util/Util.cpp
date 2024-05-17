@@ -16,9 +16,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "byteir/Dialect/mhlo/Util/Util.h"
+#include "byteir/Dialect/mhlo/DynamicShapeOpRegister/Register.h"
+#include "byteir/Dialect/mhlo/Util/ShapeInferUtil.h"
 #include "byteir/Utils/Utils.h"
-#include "lhlo/IR/lhlo_ops.h"
 #include "mhlo/IR/hlo_ops.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Operation.h"
 
 using namespace llvm;
@@ -99,37 +103,56 @@ bool mlir::isSplatMhloConstantValue(Value val, double splat_val) {
   return isSplatMhloConstantValue(val.getDefiningOp(), splat_val);
 }
 
-namespace {
-
-byteir::NamedLayout
-parsePoolLayout(size_t rank, const SmallVector<int64_t> &window_dimensions,
-                const SmallVector<int64_t> &strides,
-                const SmallVector<int64_t> &padding) {
-  byteir::NamedLayout layout = byteir::NamedLayout::UNKNOWN;
-  if (window_dimensions[0] == 1 && window_dimensions[rank - 1] == 1 &&
-      strides[0] == 1 && strides[rank - 1] == 1 && padding[0] == 0 &&
-      padding[1] == 0 && padding[2 * rank - 2] == 0 &&
-      padding[2 * rank - 1] == 0) {
-    if (rank == 4) {
-      layout = byteir::NamedLayout::NHWC;
-    } else if (rank == 5) {
-      layout = byteir::NamedLayout::NDHWC;
-    }
-  } else if (window_dimensions[0] == 1 && window_dimensions[1] == 1 &&
-             strides[0] == 1 && strides[1] == 1 && padding[0] == 0 &&
-             padding[1] == 0 && padding[2] == 0 && padding[3] == 0) {
-    if (rank == 3) {
-      layout = byteir::NamedLayout::NCW;
-    } else if (rank == 4) {
-      layout = byteir::NamedLayout::NCHW;
-    } else if (rank == 5) {
-      layout = byteir::NamedLayout::NCDHW;
-    }
+template <typename RegionOp, typename Op> bool mlir::isRegularReduceOp(Op op) {
+  if (op.getInputs().size() != 1 || op.getInitValues().size() != 1 ||
+      op.getResults().size() != 1) {
+    return false;
   }
-  return layout;
+  if (!isBlockSingleOp<RegionOp>(&op.getBody().front())) {
+    return false;
+  }
+
+  SplatElementsAttr initValue;
+  if (!matchPattern(op.getInitValues()[0], m_Constant(&initValue))) {
+    return false;
+  }
+
+  if (std::is_same_v<RegionOp, mhlo::AddOp> && isZeroAttribute(initValue)) {
+    return true;
+  } else if (std::is_same_v<RegionOp, mhlo::MaxOp> &&
+             isMinValueAttribute(initValue)) {
+    return true;
+  } else if (std::is_same_v<RegionOp, mhlo::MinOp> &&
+             isMaxValueAttribute(initValue)) {
+    return true;
+  } else if (std::is_same_v<RegionOp, mhlo::OrOp> &&
+             isZeroAttribute(initValue)) {
+    return true;
+  } else if (std::is_same_v<RegionOp, mhlo::MulOp> &&
+             isSplatElementsAttribute(cast<DenseIntOrFPElementsAttr>(initValue),
+                                      1, 1.0)) {
+    return true;
+  } else {
+    return false;
+  }
 }
 
-} // namespace
+// note: if want to add more instance, need to confirm it is a regular
+// reduce/reduce_window.
+template bool
+    mlir::isRegularReduceOp<mhlo::AddOp, mhlo::ReduceOp>(mhlo::ReduceOp);
+template bool
+    mlir::isRegularReduceOp<mhlo::MaxOp, mhlo::ReduceOp>(mhlo::ReduceOp);
+template bool
+    mlir::isRegularReduceOp<mhlo::MinOp, mhlo::ReduceOp>(mhlo::ReduceOp);
+template bool
+    mlir::isRegularReduceOp<mhlo::OrOp, mhlo::ReduceOp>(mhlo::ReduceOp);
+template bool
+    mlir::isRegularReduceOp<mhlo::MulOp, mhlo::ReduceOp>(mhlo::ReduceOp);
+template bool mlir::isRegularReduceOp<mhlo::AddOp, mhlo::ReduceWindowOp>(
+    mhlo::ReduceWindowOp);
+template bool mlir::isRegularReduceOp<mhlo::MaxOp, mhlo::ReduceWindowOp>(
+    mhlo::ReduceWindowOp);
 
 std::optional<int64_t> mlir::getCumsumIndex(mhlo::ReduceWindowOp op) {
   auto base_dilations = op.getBaseDilationsAttr();
@@ -160,7 +183,7 @@ std::optional<int64_t> mlir::getCumsumIndex(mhlo::ReduceWindowOp op) {
     return std::nullopt;
   }
   int64_t index = K_INITIAL;
-  for (size_t i = 0; i < inputShape.getRank(); i++) {
+  for (int64_t i = 0; i < inputShape.getRank(); i++) {
     if (window_dimensions[i] == 1 && padding[i * 2] == 0 &&
         padding[i * 2 + 1] == 0) {
       // not cumsum index
@@ -184,18 +207,109 @@ std::optional<int64_t> mlir::getCumsumIndex(mhlo::ReduceWindowOp op) {
   return index;
 }
 
-byteir::NamedLayout mlir::getPoolLayout(mlir::mhlo::ReduceWindowOp op) {
-  auto base_dilations = op.getBaseDilationsAttr();
-  if (base_dilations && !isSplatValue(base_dilations, 1)) {
-    // expected base_dilations to be dense<1>
-    return byteir::NamedLayout::UNKNOWN;
+template <typename OpTy> bool mlir::isValidPoolOrPoolGradLayout(OpTy op) {
+  SmallVector<int64_t> window_dimensions;
+  size_t rank;
+  if (std::is_same_v<OpTy, mhlo::ReduceWindowOp>) {
+    auto reduceWindowOp = dyn_cast<mhlo::ReduceWindowOp>(&op);
+    auto base_dilations = reduceWindowOp->getBaseDilationsAttr();
+    if (base_dilations && !isSplatValue(base_dilations, 1)) {
+      return false;
+    }
+    auto window_dilations = reduceWindowOp->getWindowDilationsAttr();
+    if (window_dilations && !isSplatValue(window_dilations, 1)) {
+      return false;
+    }
+    window_dimensions =
+        SmallVector<int64_t>(reduceWindowOp->getWindowDimensions()
+                                 .template getValues<int64_t>()
+                                 .begin(),
+                             reduceWindowOp->getWindowDimensions()
+                                 .template getValues<int64_t>()
+                                 .end());
+    rank = window_dimensions.size();
+    if (rank != 3 && rank != 4 && rank != 5) {
+      return false;
+    }
+  } else if (std::is_same_v<OpTy, mhlo::SelectAndScatterOp>) {
+    auto selectAndScatterOp = dyn_cast<mhlo::SelectAndScatterOp>(&op);
+    if (auto window_dimensions_ =
+            selectAndScatterOp->getWindowDimensionsAttr()) {
+      window_dimensions = SmallVector<int64_t>(
+          window_dimensions_.template getValues<int64_t>().begin(),
+          window_dimensions_.template getValues<int64_t>().end());
+    } else {
+      return false;
+    }
+    rank = window_dimensions.size();
+    if (rank != 4 && rank != 5) {
+      return false;
+    }
+  } else {
+    assert(false && "The operation type is unexpected\n");
   }
-  auto window_dilations = op.getWindowDilationsAttr();
-  if (window_dilations && !isSplatValue(window_dilations, 1)) {
-    // expected window_dilations to be dense<1>
-    return byteir::NamedLayout::UNKNOWN;
+  if ((window_dimensions[0] != 1) ||
+      (window_dimensions[1] != 1 && window_dimensions[rank - 1] != 1)) {
+    return false;
   }
 
+  if (auto window_strides = op.getWindowStridesAttr()) {
+    SmallVector<int64_t> strides(
+        window_strides.template getValues<int64_t>().begin(),
+        window_strides.template getValues<int64_t>().end());
+    if ((strides[0] != 1) || (strides[1] != 1 && strides[rank - 1] != 1)) {
+      return false;
+    }
+  }
+  if (auto padding_ = op.getPaddingAttr()) {
+    SmallVector<int64_t> padding(padding_.template getValues<int64_t>().begin(),
+                                 padding_.template getValues<int64_t>().end());
+    if (padding[0] != 0 || padding[1] != 0 ||
+        ((padding[2] != 0 || padding[3] != 0) &&
+         (padding[2 * rank - 1 != 0] || padding[2 * rank - 2] != 0))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template bool mlir::isValidPoolOrPoolGradLayout(mhlo::ReduceWindowOp);
+template bool mlir::isValidPoolOrPoolGradLayout(mhlo::SelectAndScatterOp);
+
+namespace {
+byteir::NamedLayout
+parsePoolLayout(size_t rank, const SmallVector<int64_t> &window_dimensions,
+                const SmallVector<int64_t> &strides,
+                const SmallVector<int64_t> &padding) {
+  byteir::NamedLayout layout = byteir::NamedLayout::UNKNOWN;
+  if (window_dimensions[0] == 1 && window_dimensions[rank - 1] == 1 &&
+      strides[0] == 1 && strides[rank - 1] == 1 && padding[0] == 0 &&
+      padding[1] == 0 && padding[2 * rank - 2] == 0 &&
+      padding[2 * rank - 1] == 0) {
+    if (rank == 4) {
+      layout = byteir::NamedLayout::NHWC;
+    } else if (rank == 5) {
+      layout = byteir::NamedLayout::NDHWC;
+    }
+  } else if (window_dimensions[0] == 1 && window_dimensions[1] == 1 &&
+             strides[0] == 1 && strides[1] == 1 && padding[0] == 0 &&
+             padding[1] == 0 && padding[2] == 0 && padding[3] == 0) {
+    if (rank == 3) {
+      layout = byteir::NamedLayout::NCW;
+    } else if (rank == 4) {
+      layout = byteir::NamedLayout::NCHW;
+    } else if (rank == 5) {
+      layout = byteir::NamedLayout::NCDHW;
+    }
+  }
+  return layout;
+}
+} // namespace
+
+byteir::NamedLayout mlir::getPoolLayout(mlir::mhlo::ReduceWindowOp op) {
+  if (!mlir::isValidPoolOrPoolGradLayout(op)) {
+    return byteir::NamedLayout::UNKNOWN;
+  }
   SmallVector<int64_t> window_dimensions = SmallVector<int64_t>(
       op.getWindowDimensions().getValues<int64_t>().begin(),
       op.getWindowDimensions().getValues<int64_t>().end());
@@ -211,14 +325,13 @@ byteir::NamedLayout mlir::getPoolLayout(mlir::mhlo::ReduceWindowOp op) {
                                    padding_.getValues<int64_t>().end());
   }
 
-  if (rank != 3 && rank != 4 && rank != 5) {
-    // expected dimension number to be 3, 4 or 5
-    return byteir::NamedLayout::UNKNOWN;
-  }
   return parsePoolLayout(rank, window_dimensions, strides, padding);
 }
 
 byteir::NamedLayout mlir::getPoolGradLayout(mlir::mhlo::SelectAndScatterOp op) {
+  if (!mlir::isValidPoolOrPoolGradLayout(op)) {
+    return byteir::NamedLayout::UNKNOWN;
+  }
   SmallVector<int64_t> window_dimensions;
   if (auto window_dimensions_ = op.getWindowDimensionsAttr()) {
     window_dimensions =
@@ -236,8 +349,6 @@ byteir::NamedLayout mlir::getPoolGradLayout(mlir::mhlo::SelectAndScatterOp op) {
     padding = SmallVector<int64_t>(padding_.getValues<int64_t>().begin(),
                                    padding_.getValues<int64_t>().end());
   }
-
-  assert(rank == 4 || rank == 5);
   return parsePoolLayout(rank, window_dimensions, strides, padding);
 }
 
@@ -394,8 +505,6 @@ void mlir::handleConvAttribute(NamedAttrList &attrs, T conv_op,
 // instantiate
 template void mlir::handleConvAttribute<mhlo::ConvolutionOp>(
     NamedAttrList &, mhlo::ConvolutionOp, OpBuilder &);
-template void mlir::handleConvAttribute<lmhlo::ConvolutionOp>(
-    NamedAttrList &, lmhlo::ConvolutionOp, OpBuilder &);
 
 namespace {
 
@@ -537,16 +646,10 @@ mlir::computeReshapeInputOutputRankMapIndex(ShapedType inputType,
       j++;
     }
   }
-  if (result.size() != inputType.getRank()) {
+  if (result.size() != static_cast<size_t>(inputType.getRank())) {
     return std::nullopt;
   }
   return result;
-}
-
-bool mlir::isLmhloConstantValue(mlir::Value value) {
-  return llvm::any_of(value.getUses(), [&](OpOperand &use) {
-    return llvm::isa<lmhlo::ConstantOp>(use.getOwner());
-  });
 }
 
 // compute the index of the reshape's expand dimension
@@ -566,10 +669,58 @@ mlir::computeReshapeExpandDim(mhlo::ReshapeOp reshapeOp) {
     return std::nullopt;
   }
   auto index = *maybeIndex;
-  for (int64_t i = 0; i < reshapeResultType.getRank(); i++) {
+  for (int64_t i = 0; i < reshapeOperandType.getRank(); i++) {
     if (index[i] != i) {
       return i;
     }
   }
-  return std::nullopt;
+  return reshapeOperandType.getRank();
+}
+
+FailureOr<SmallVector<Value>>
+mlir::createEmptyTensorForOpResult(OpBuilder &builder, Operation *op) {
+  SmallVector<Value> emptyTensors;
+  bool resultsHasDynamicShape = false;
+  for (auto &&result : op->getResults()) {
+    if (auto resType = result.getType().template dyn_cast<ShapedType>()) {
+      if (resType.hasStaticShape()) {
+        auto emptyOp = builder.create<tensor::EmptyOp>(
+            op->getLoc(), resType.getShape(), resType.getElementType());
+        emptyTensors.emplace_back(emptyOp);
+      } else {
+        resultsHasDynamicShape = true;
+        break;
+      }
+    }
+  }
+
+  if (resultsHasDynamicShape) {
+    emptyTensors.clear();
+    registerAllMhloReifyReturnTypeShapes();
+    SmallVector<Value, 1> reifications;
+
+    if (reifyShapes(builder, op, reifications).failed()) {
+      return failure();
+    }
+
+    for (auto &&resultAndShape : llvm::zip(op->getResults(), reifications)) {
+      SmallVector<Value, 1> dynamicSizes;
+      auto resType = std::get<0>(resultAndShape).getType().cast<ShapedType>();
+      for (int64_t i = 0; i < resType.getRank(); ++i) {
+        if (resType.isDynamicDim(i)) {
+          auto dim = builder
+                         .create<tensor::ExtractOp>(
+                             op->getLoc(), std::get<1>(resultAndShape),
+                             ValueRange{builder.create<arith::ConstantIndexOp>(
+                                 op->getLoc(), static_cast<int64_t>(i))})
+                         .getResult();
+          dynamicSizes.emplace_back(dim);
+        }
+      }
+      auto emptyOp =
+          builder.create<tensor::EmptyOp>(op->getLoc(), resType, dynamicSizes);
+      emptyTensors.emplace_back(emptyOp);
+    }
+  }
+  return emptyTensors;
 }

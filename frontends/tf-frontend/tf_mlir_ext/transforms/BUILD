@@ -37,7 +37,7 @@ td_library(
     includes = ["../../external/tensorflow"], # patch tensorflow_ops_td_files's `includes`
     deps = [
         "@org_tensorflow//tensorflow/compiler/mlir/tensorflow:tensorflow_ops_td_files",
-        "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo:hlo_ops_td_files",
+        "@local_xla//xla/mlir_hlo:hlo_ops_td_files",
     ],
 )
 
@@ -77,16 +77,20 @@ gentbl_cc_library(
 cc_library(
     name = "tfext_passes",
     srcs = [
-        "constant_folding.cc",
-        "fuse_tf_ops.cc",
-        "mhlo_legalize_tf_ext.cc",
-        "process_dynamic_stitch_as_static.cc",
-        "reshape_movedown_string.cc",
-        "remove_control_flow.cc",
-        "rewrite_to_if.cc",
-        "rewrite_func_attr_to_byteir.cc",
-        "rewrite_to_custom_call.cc",
-        "tf_fallback_to_custom_call.cc",
+      "constant_folding.cc",
+      "fuse_tf_ops.cc",
+      "mhlo_legalize_tf_ext.cc",
+      "process_dynamic_stitch_as_static.cc",
+      "reshape_movedown_string.cc",
+      "remove_control_flow.cc",
+      "rewrite_to_if.cc",
+      "rewrite_func_attr_to_byteir.cc",
+      "rewrite_to_custom_call.cc",
+      "tf_fallback_to_custom_call.cc",
+      "tf_switch_merge_to_if.cc",
+      "remove_cstr_reshapable.cc",
+      "convert_repeat_to_tile.cc",
+      "set_repeat_out_batch_size.cc",
     ],
     hdrs = [
       "constant_folding.h",
@@ -100,6 +104,10 @@ cc_library(
       "rewrite_func_attr_to_byteir.h",
       "rewrite_to_custom_call.h",
       "tf_fallback_to_custom_call.h",
+      "tf_switch_merge_to_if.h",
+      "remove_cstr_reshapable.h",
+      "convert_repeat_to_tile.h",
+      "set_repeat_out_batch_size.h",
     ],
     textual_hdrs = [
        "passes_detail.h",
@@ -110,7 +118,7 @@ cc_library(
     deps = [
       "//utils:attributes",
       "//tf_mlir_ext/utils:tfext_utils",
-      "//byteir/Dialect/Ace:ace_dialect",
+      "@byteir//:ace_dialect",
       ":tfext_pass_inc_gen",
       ":tfext_fuse_tf_ops_pattern_gen",
       ":tfext_rewrite_to_custom_call_pattern_gen",
@@ -118,7 +126,7 @@ cc_library(
       "@org_tensorflow//tensorflow/compiler/mlir/tensorflow:shape_inference_utils",
       "@org_tensorflow//tensorflow/compiler/mlir/tensorflow:tensorflow",
       "@org_tensorflow//tensorflow/compiler/mlir/lite:validators",
-      "@org_tensorflow//tensorflow/compiler/xla/mlir_hlo",
+      "@local_xla//xla/mlir_hlo",
       "@llvm-project//llvm:Support",
       "@llvm-project//mlir:Dialect",
       "@llvm-project//mlir:IR",

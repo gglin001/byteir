@@ -15,6 +15,7 @@
 from torch_e2e_testing.framework import generate_golden_trace
 import brt
 import byteir
+from byteir._backend_registry import get_target_device
 from mhlo_tools.ir_executor import Interpreter
 from mhlo_tools.mlir import ir
 import torch
@@ -24,6 +25,7 @@ from mhlo_tools.ir_executor.helper import (
     mlir_type_to_dtype
 )
 import os
+import shutil
 import torch_frontend
 import traceback
 from utils import TestResult
@@ -46,7 +48,7 @@ def np_type_to_torch_type(np_dtype):
     return _map.get(np_dtype, None)
 
 
-def generate_np_inputs(interp):
+def generate_np_inputs(interp, mode: str = "", low = 0.0, high = 1.0):
     module = interp._mod
     entry_func = module.body.operations[0]
     ret = []
@@ -59,11 +61,14 @@ def generate_np_inputs(interp):
         elif dtype in [np.uint8, np.int8, np.int16, np.uint16, np.int32, np.uint32, np.int64, np.uint64]:
             ret.append(np.random.randint(50, size=shape).astype(dtype))
         else:
-            ret.append(np.random.random(size=shape).astype(dtype))
+            if mode == "uniform":
+                ret.append(np.random.uniform(low=low, high=high, size=shape).astype(dtype))
+            else:
+                ret.append(np.random.random(size=shape).astype(dtype))
     return ret
 
 
-def generate_torch_outputs(interp):
+def generate_torch_outputs(interp, device: str = "cuda"):
     module = interp._mod
     entry_func = module.body.operations[0]
     torch_outputs = []
@@ -75,7 +80,7 @@ def generate_torch_outputs(interp):
                 dtype = np_type_to_torch_type(
                     mlir_type_to_dtype(shaped_type.element_type))
                 torch_outputs.append(torch.empty(
-                    shape, dtype=dtype, device="cuda"))
+                    shape, dtype=dtype, device=device))
     return torch_outputs
 
 
@@ -84,12 +89,94 @@ def get_entry_func_name(interp):
     entry_func = module.body.operations[0].name.value
     return entry_func
 
+def gen_golden_mlir(mhlo_file, target, **kwargs):
+    """
+    Arguements:
+        @param mhlo_file: Source stablehlo/mhlo file.
+        @param target: Target name like `cpu`,`cuda`
+        @param num: Numbers of generated golden in/output, default to 5.
+        @param mode:  The data distribution of inputs.
+        @param low/hing: The range of generated inputs data.
+    """
+    def save_np_data(fpath: str, data):
+        np.save(fpath, data)
 
-def compile_and_run_mlir(mhlo_file, target):
+    np.random.seed(0)
     try:
-        interp = Interpreter.load_from_file(mhlo_file)
-        np_inputs = generate_np_inputs(interp)
+        if target.lower() == "cpu":
+            interp = Interpreter.load_from_file(mhlo_file, is_stablehlo=True)
+        else:
+            interp = Interpreter.load_from_file(mhlo_file)
         func_name = get_entry_func_name(interp)
+        unique_name = os.path.basename(mhlo_file).split('.')[0]
+        unique_name = unique_name + "." + target
+        iter_number = kwargs["num"] if "num" in kwargs else 5
+
+        WORK_FOLDER = kwargs["golden_dir"] if "golden_dir" in kwargs else "./local_test"
+        WORK_FOLDER = WORK_FOLDER + f"/{unique_name}"
+        os.makedirs(WORK_FOLDER, exist_ok=True)
+
+        for idx in range(0, iter_number):
+            if "mode" in kwargs:
+                input_mode = kwargs["mode"]
+                low = kwargs["low"] if "low" in kwargs else None
+                high = kwargs["high"] if "high" in kwargs else None
+                np_inputs = generate_np_inputs(interp, input_mode, low, high)
+            else:
+                np_inputs = generate_np_inputs(interp)
+
+            # run golden
+            golden_outputs = interp.call_function(func_name, np_inputs)
+
+            # dump to local file
+            save_np_data(WORK_FOLDER + f"/input_{str(idx)}.npy", np_inputs)
+            save_np_data(WORK_FOLDER +  f"/output_{str(idx)}.npy", golden_outputs)
+
+            del np_inputs, golden_outputs
+
+        # byteir compile
+        output_mlir_file_name = f'{WORK_FOLDER}/{unique_name}.rt.mlir'
+        byteir.compile(mhlo_file, output_mlir_file_name,
+                       entry_func=func_name, target=target)
+
+        # cp orininal mlir file
+        shutil.copy(mhlo_file, f"{WORK_FOLDER}/{os.path.basename(mhlo_file).split('.')[0]}.stablehlo.mlir")
+
+        
+    except Exception as e:
+        return TestResult(unique_name=mhlo_file,
+                          compilation_error="".join(
+                              traceback.format_exception(
+                                  type(e), e, e.__traceback__)),
+                          runtime_error=None,
+                          numerical_error=None)
+
+    res = TestResult(unique_name=mhlo_file,
+                     compilation_error=None,
+                     runtime_error=None,
+                     numerical_error=None)
+
+    return res
+
+
+
+def compile_and_run_mlir(mhlo_file, target, **kwargs):
+    np.random.seed(0)
+    try:
+        if target.lower() == "cpu":
+            interp = Interpreter.load_from_file(mhlo_file, is_stablehlo=True)
+        else:
+            interp = Interpreter.load_from_file(mhlo_file)
+        if "mode" in kwargs:
+            input_mode = kwargs["mode"]
+            low = kwargs["low"] if "low" in kwargs else None
+            high = kwargs["high"] if "high" in kwargs else None
+            np_inputs = generate_np_inputs(interp, input_mode, low, high)
+        else:
+            np_inputs = generate_np_inputs(interp)
+        func_name = get_entry_func_name(interp)
+        unique_name = os.path.basename(mhlo_file).split('.')[0]
+        unique_name = unique_name + "." + target
 
         # run golden
         golden_outputs = interp.call_function(func_name, np_inputs)
@@ -97,8 +184,8 @@ def compile_and_run_mlir(mhlo_file, target):
         # byteir compile
         TEMP_FOLDER = "./local_test"
         os.makedirs(TEMP_FOLDER, exist_ok=True)
-        os.makedirs(TEMP_FOLDER + f"/{func_name}", exist_ok=True)
-        output_mlir_file_name = f'{TEMP_FOLDER}/{func_name}/{func_name}.rt.mlir'
+        os.makedirs(TEMP_FOLDER + f"/{unique_name}", exist_ok=True)
+        output_mlir_file_name = f'{TEMP_FOLDER}/{unique_name}/{unique_name}.rt.mlir'
         byteir.compile(mhlo_file, output_mlir_file_name,
                        entry_func=func_name, target=target)
     except Exception as e:
@@ -110,19 +197,28 @@ def compile_and_run_mlir(mhlo_file, target):
                           numerical_error=None)
     # brt runtime
     try:
-        session = brt.Session(alloc_func=caching_allocator_alloc,
-                               free_func=caching_allocator_delete)
+        cur_device = get_target_device(target)
+        _allocator_alloc = None
+        _allocator_delete = None
+        _stream = None
+        if "cuda" == cur_device:
+            _allocator_alloc = caching_allocator_alloc
+            _allocator_delete = caching_allocator_delete
+            _stream = torch.cuda.current_stream()._as_parameter_.value
+
+        session = brt.Session(device=cur_device.upper(),
+                              alloc_func=_allocator_alloc,
+                              free_func=_allocator_delete)
         session.load(output_mlir_file_name)
-        req = session.new_request_context(
-            torch.cuda.current_stream()._as_parameter_.value)
+        req = session.new_request_context(_stream)
         torch_inputs = []
         torch_outputs = []
         for np_input in np_inputs:
-            data = torch.from_numpy(np_input).contiguous().cuda()
+            data = torch.from_numpy(np_input).contiguous().to(cur_device)
             data = data.to(np_type_to_torch_type(np_input.dtype))
             torch_inputs.append(data)
 
-        torch_outputs = generate_torch_outputs(interp)
+        torch_outputs = generate_torch_outputs(interp, cur_device)
         for offset, arg in zip(session.get_input_arg_offsets(), torch_inputs):
             assert list(session.get_static_shape(offset)) == list(arg.shape)
         for offset, ret in zip(session.get_output_arg_offsets(), torch_outputs):
@@ -148,7 +244,7 @@ def compile_and_run_mlir(mhlo_file, target):
         for golden_output, output in zip(golden_outputs, torch_outputs):
             # print("golden output: ", golden_output)
             # print("actual output: ", output.detach().cpu().numpy())
-            data = torch.from_numpy(golden_output).contiguous().cuda()
+            data = torch.from_numpy(golden_output).contiguous().to(cur_device)
             data = data.to(np_type_to_torch_type(golden_output.dtype))
             torch.testing.assert_close(data, output)
         # assert(np.allclose(golden_output, output.detach().cpu().numpy()))
@@ -174,7 +270,7 @@ def compile_and_run_torch(test, target):
         torch_inputs = [input.clone().cuda() for input in trace_item.inputs]
         torch_outputs = [torch.empty_like(trace_item.output).cuda()]
         compiled_graph = torch_frontend.compile(
-            test.program_factory(), torch_inputs, 'mhlo')
+            test.program_factory(), torch_inputs, 'stablehlo')
 
         TEMP_FOLDER = "./local_test"
         os.makedirs(TEMP_FOLDER, exist_ok=True)

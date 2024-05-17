@@ -17,19 +17,26 @@
 
 #include "brt/backends/cpu/providers/default/cpu_provider.h"
 
+#include "./custom_call/repeat.h"
 #include "./custom_call/tf_equal.h"
+#include "./custom_call/tf_select.h"
+#include "./custom_call/tf_string_to_number.h"
 #include "./custom_call/tf_where.h"
+#include "./custom_call/topk.h"
 #include "./llvm/jit.h"
+#include "./math/elementwise_ops.h"
 #include "./shape/shape_compute.h"
 #include "./tensor_generate/fill.h"
+#include "./tensor_generate/rng_state.h"
 #include "./typecvt/typecvt.h"
 #include "brt/backends/common.h"
-#include "brt/backends/cpu/providers/default/math/elementwise_ops.h" // TODO move to another header
 #include "brt/core/framework/execution_provider.h"
 #include "brt/core/session/session.h"
 #include "half/half.hpp"
 
 #include <memory>
+
+#define BRT_CPU_DEFAULT_OMP_NUM_THREADS 12
 
 using namespace brt;
 using namespace brt::common;
@@ -93,17 +100,68 @@ BRT_STATIC_KERNEL_REGISTRATION(
           [](const brt::OpKernelInfo &info) -> std::shared_ptr<OpKernel> {
             return std::make_shared<cpu::TFEqual>(info);
           });
+      registry->Register(
+          "byteir.top_k",
+          [](const brt::OpKernelInfo &info) -> std::shared_ptr<OpKernel> {
+            return std::make_shared<cpu::TopK>(info);
+          });
+      // registry->Register(
+      //     "byteir.repeat",
+      //     [](const brt::OpKernelInfo &info) -> std::shared_ptr<OpKernel> {
+      //       return std::make_shared<cpu::Repeat>(info);
+      //     });
+      registry->Register(
+          "tf.Select",
+          [](const brt::OpKernelInfo &info) -> std::shared_ptr<OpKernel> {
+            return std::make_shared<cpu::TFSelect>(info);
+          });
+      registry->Register(
+          "tf.StringToNumber",
+          [](const brt::OpKernelInfo &info) -> std::shared_ptr<OpKernel> {
+            return std::make_shared<cpu::TFStringToNumber>(info);
+          });
+      registry->Register(
+          "GetSeed",
+          [](const brt::OpKernelInfo &info) -> std::shared_ptr<OpKernel> {
+            return std::make_shared<cpu::GetSeedOpKernel>(info);
+          });
+      registry->Register(
+          "NextOffset",
+          [](const brt::OpKernelInfo &info) -> std::shared_ptr<OpKernel> {
+            return std::make_shared<cpu::NextOffsetOpKernel>(info);
+          });
       RegisterCommonBuiltinOps(registry);
     });
 
 } // namespace
 
-CPUExecutionProvider::CPUExecutionProvider(const std::string &name)
-    : ExecutionProvider(DeviceKind::CPU, name) {}
+static CPUExecutionProviderOptions GetDefaultCPUOptions() {
+  CPUExecutionProviderOptions options;
+  // TODO: fix default value
+  options.brt_omp_num_threads = BRT_CPU_DEFAULT_OMP_NUM_THREADS;
+  return options;
+}
+
+CPUExecutionProvider::CPUExecutionProvider(
+    const CPUExecutionProviderOptions &options, const std::string &name)
+    : ExecutionProvider(DeviceKind::CPU, name), options_(options) {}
+
+const CPUExecutionProviderOptions &
+CPUExecutionProvider::GetProviderOptions() const {
+  return options_;
+}
 
 common::Status NaiveCPUExecutionProviderFactory(Session *session) {
+  // use default CPU provider options
+  CPUExecutionProviderOptions default_options = GetDefaultCPUOptions();
+  return NaiveCPUExecutionProviderFactory(session, default_options);
+}
+
+common::Status
+NaiveCPUExecutionProviderFactory(Session *session,
+                                 const CPUExecutionProviderOptions &options) {
   // create a CPU provider
-  auto cpu_provider = std::make_unique<CPUExecutionProvider>();
+  auto cpu_provider = std::make_unique<CPUExecutionProvider>(options);
 
   // give ownership to the session
   return session->AddExecutionProvider(std::move(cpu_provider));

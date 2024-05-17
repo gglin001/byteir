@@ -14,6 +14,8 @@
 
 #include "onnx/onnx_pb.h"
 #include "onnx/shape_inference/implementation.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Debug.h"
 
 #include "third_party/onnx-mlir/src/Builder/FrontendDialectTransformer.hpp"
@@ -25,6 +27,7 @@
 
 #define DEBUG_TYPE "OFCompilerUtils"
 
+#include <cassert>
 #include <fstream>
 
 namespace onnx_mlir {
@@ -36,6 +39,53 @@ void ImportFrontendModelInternal(onnx::ModelProto &model,
 
 namespace onnx_frontend {
 
+void ParseStrToVectorIntMaps(
+    llvm::StringRef name_and_shapes,
+    std::unordered_map<std::string, std::vector<int>> &name2shape) {
+  // llvm split string into vector
+  llvm::SmallVector<llvm::StringRef, 4> name_and_shape_vec;
+  name_and_shapes.split(name_and_shape_vec, ':', -1, false);
+  for (const auto &name_and_shape : name_and_shape_vec) {
+    llvm::SmallVector<llvm::StringRef, 4> tokens;
+    name_and_shape.split(tokens, ',', -1, false);
+    if (tokens.size() <= 1) {
+      printf("Not valid name and shape str: %s\n", name_and_shape.data());
+      assert(false);
+    }
+    std::string name = tokens[0].str();
+    std::vector<int> shape;
+    for (unsigned int i = 1; i < tokens.size(); ++i) {
+      shape.push_back(std::stoi(tokens[i].str()));
+    }
+    name2shape[name] = shape;
+  }
+}
+
+void UpdateDimValue(onnx::ValueInfoProto &valueInfo,
+                    const std::string &dimParam, int64_t value) {
+  auto *type = valueInfo.mutable_type();
+  LLVM_DEBUG(llvm::dbgs() << "value info name" << valueInfo.name() << "\n");
+  if (type->value_case() != onnx::TypeProto::kTensorType)
+    return;
+  onnx::TensorShapeProto *shape = type->mutable_tensor_type()->mutable_shape();
+  if (shape->dim_size() == 0)
+    return;
+  for (auto &dim : *(shape->mutable_dim())) {
+    if (dim.has_dim_param() && dim.dim_param() == dimParam) {
+      LLVM_DEBUG(llvm::dbgs() << "replace dynamic bs \n");
+      dim.set_dim_value(value);
+    }
+  }
+}
+
+void ReplaceSymbolicDimValue(onnx::GraphProto *graph,
+                             const std::string &dimParam, int64_t value) {
+  for (onnx::ValueInfoProto &valueInfo : *(graph->mutable_value_info()))
+    UpdateDimValue(valueInfo, dimParam, value);
+  for (onnx::ValueInfoProto &valueInfo : *(graph->mutable_output()))
+    UpdateDimValue(valueInfo, dimParam, value);
+}
+
 void SetBatchSize(onnx::ModelProto &model) {
   if (batchSize <= 0) {
     LLVM_DEBUG(llvm::dbgs() << "SetBatchSize() skipped for onnx pb\n");
@@ -43,15 +93,14 @@ void SetBatchSize(onnx::ModelProto &model) {
   }
 
   onnx::GraphProto *graph = model.mutable_graph();
+  std::string batchDimParam;
+  bool hasDynamicBatchSize = false;
+  bool sameStaticBatchSize = false;
 
   std::set<std::string> initializerNames;
   for (const auto &initializer : graph->initializer()) {
     const std::string &initializerName = initializer.name();
     initializerNames.insert(initializerName);
-  }
-  std::map<std::string, int> valueInfoNameToIdx;
-  for (int i = 0; i < graph->value_info_size(); i++) {
-    valueInfoNameToIdx[graph->value_info(i).name()] = i;
   }
   for (auto &input : *(graph->mutable_input())) {
     if (initializerNames.count(input.name()))
@@ -69,22 +118,42 @@ void SetBatchSize(onnx::ModelProto &model) {
       continue;
     }
     auto *dim = shape->mutable_dim(0);
-    bool isDynamic = !dim->has_dim_value() || dim->dim_value() <= 0;
+    bool isDynamic = (!dim->has_dim_value() || dim->dim_value() <= 0);
+    if (isDynamic)
+      hasDynamicBatchSize = true;
+    else if (dim->dim_value() == batchSize)
+      sameStaticBatchSize = true;
     if (isDynamic || forceSetBatchSize) {
+      if (dim->has_dim_param()) {
+        if (!batchDimParam.empty())
+          assert(batchDimParam == dim->dim_param() &&
+                 "mismatched batchsize dimparam among different inputs!");
+        batchDimParam = dim->dim_param();
+        LLVM_DEBUG(llvm::dbgs()
+                   << "dynamic bs symbol: " << batchDimParam << "\n");
+      }
       dim->set_dim_value(batchSize);
-      dim->clear_dim_param();
       LLVM_DEBUG(llvm::dbgs() << "bs of " << input.name() << " set to "
                               << batchSize << "\n");
-      if (valueInfoNameToIdx.count(input.name())) {
-        int index = valueInfoNameToIdx[input.name()];
-        graph->mutable_value_info(index)->CopyFrom(input);
-      }
     } else {
       LLVM_DEBUG(llvm::dbgs() << "bs of " << input.name() << " remains "
                               << dim->dim_value() << "\n");
     }
   }
-  if (forceSetBatchSize) {
+
+  if (hasDynamicBatchSize &&
+      !batchDimParam.empty()) { // replace dynamic batch size with dim_param
+    LLVM_DEBUG(llvm::dbgs() << "replace dynamic bs\n");
+    ReplaceSymbolicDimValue(graph, batchDimParam, batchSize);
+  } else if (sameStaticBatchSize ||
+             (!hasDynamicBatchSize &&
+              !forceSetBatchSize)) { // same static batch size, or static bs w/o
+                                     // forceSetBatchSize
+    LLVM_DEBUG(llvm::dbgs() << "keep original bs\n");
+  } else { // dynamic batch size without dim_param (?) or static bs with
+           // forceSetBatchSize
+    LLVM_DEBUG(llvm::dbgs() << "cannot keep value info, clear\n");
+    graph->clear_value_info();
     for (auto &output : *(graph->mutable_output())) {
       auto *type = output.mutable_type();
       if (type->value_case() != onnx::TypeProto::kTensorType) {
@@ -94,6 +163,93 @@ void SetBatchSize(onnx::ModelProto &model) {
       tensorType->clear_shape();
     }
   }
+}
+
+void SetInputShapes(onnx::ModelProto &model) {
+  std::unordered_map<std::string, std::vector<int>> name2shape;
+  ParseStrToVectorIntMaps(inputShapes, name2shape);
+  onnx::GraphProto *graph = model.mutable_graph();
+  for (auto &input : *(graph->mutable_input())) {
+    if (!name2shape.count(input.name())) {
+      continue;
+    }
+    auto *type = input.mutable_type();
+    if (type->value_case() != onnx::TypeProto::kTensorType) {
+      continue;
+    }
+    auto *tensorType = type->mutable_tensor_type();
+    if (!tensorType->has_shape()) {
+      continue;
+    }
+    onnx::TensorShapeProto *shape = tensorType->mutable_shape();
+    if (shape->dim_size() == 0) {
+      continue;
+    }
+    auto shapeVec = name2shape[input.name()];
+    int rank = shapeVec.size();
+    assert(shape->dim_size() == rank);
+    for (int i = 0; i < rank; ++i) {
+      auto *dim = shape->mutable_dim(i);
+      dim->set_dim_value(shapeVec[i]);
+      dim->clear_dim_param();
+    }
+  }
+  for (auto &output : *(graph->mutable_output())) {
+    auto *type = output.mutable_type();
+    if (type->value_case() != onnx::TypeProto::kTensorType) {
+      continue;
+    }
+    auto *tensorType = type->mutable_tensor_type();
+    tensorType->clear_shape();
+  }
+}
+
+namespace {
+void traverse_onnx_graph_preorder(
+    onnx::GraphProto &g, std::function<void(onnx::GraphProto &g)> callback) {
+  callback(g);
+
+  for (auto &node : *(g.mutable_node())) {
+    for (auto &attr : *(node.mutable_attribute())) {
+      if (attr.has_g()) {
+        callback(*(attr.mutable_g()));
+      }
+    }
+  }
+}
+
+void remove_invalid_dim_val_impl(onnx::GraphProto &g) {
+  // remove invalid dim value in current `ValueInfoProto`.
+  auto _remove_invalid_val = [](::onnx::ValueInfoProto &vi) {
+    if (vi.has_type() && vi.type().has_tensor_type() &&
+        vi.type().tensor_type().has_shape()) {
+      onnx::TensorShapeProto *shape =
+          vi.mutable_type()->mutable_tensor_type()->mutable_shape();
+      for (int i = 0; i < shape->dim_size(); ++i) {
+        auto dim = shape->mutable_dim(i);
+        if (dim->has_dim_value() && dim->dim_value() < 1) {
+          LLVM_DEBUG(llvm::dbgs() << "remove invalid dim val: " << vi.name()
+                                  << "=" << dim->dim_value() << "\n");
+          dim->Clear();
+        }
+      }
+    }
+  };
+
+  for (auto &input : *(g.mutable_input()))
+    _remove_invalid_val(input);
+
+  for (auto &output : *(g.mutable_output()))
+    _remove_invalid_val(output);
+
+  for (auto &vi : *(g.mutable_value_info()))
+    _remove_invalid_val(vi);
+}
+} // namespace
+
+void RemoveInvalidDimValues(onnx::ModelProto &model) {
+  onnx::GraphProto *graph = model.mutable_graph();
+  traverse_onnx_graph_preorder(*graph, remove_invalid_dim_val_impl);
 }
 
 namespace {
@@ -122,6 +278,7 @@ int processInputFile(std::string inputFilename, mlir::MLIRContext &context,
 
   onnx_mlir::ImportOptions options;
   options.useOnnxModelTypes = onnx_mlir::useOnnxModelTypes;
+  options.keepCustomOpTypes = onnx_mlir::keepCustomOpTypes;
   options.invokeOnnxVersionConverter = onnx_mlir::invokeOnnxVersionConverter;
   options.shapeInformation = onnx_mlir::shapeInformation;
   options.externalDataDir = dirName(inputFilename);
@@ -139,7 +296,11 @@ int processInputFile(std::string inputFilename, mlir::MLIRContext &context,
     *errorMessage = "Onnx Model Parsing Failed on " + inputFilename;
     return onnx_mlir::InvalidOnnxFormat;
   }
+  RemoveInvalidDimValues(model);
   SetBatchSize(model);
+  if (!inputShapes.empty()) {
+    SetInputShapes(model);
+  }
   onnx_mlir::ImportFrontendModelInternal(model, context, module, options);
   return onnx_mlir::CompilerSuccess;
 }
@@ -150,7 +311,7 @@ int emitOutput(mlir::OwningOpRef<mlir::ModuleOp> &module,
                onnx_frontend::EmissionTargetType emissionTarget,
                bool emitElide) {
   if (emissionTarget == onnx_frontend::EmitONNXIR ||
-      emissionTarget == onnx_frontend::EmitMhloIR) {
+      emissionTarget == onnx_frontend::EmitStablehloIR) {
     if (emitElide) {
       return onnx_mlir::outputCode(module, outputFilename,
                                    /*largeElementLimit=*/100);
@@ -165,9 +326,12 @@ int compileModule(mlir::OwningOpRef<mlir::ModuleOp> &module,
                   mlir::PassManager &pm, std::string outputFilename,
                   onnx_frontend::EmissionTargetType emissionTarget,
                   bool emitElide) {
-  if (mlir::failed(pm.run(*module)))
+  bool runFailure = mlir::failed(pm.run(*module));
+  int outputStatus =
+      emitOutput(module, outputFilename, emissionTarget, emitElide);
+  if (runFailure)
     return onnx_mlir::CompilerFailure;
-  return emitOutput(module, outputFilename, emissionTarget, emitElide);
+  return outputStatus;
 }
 
 } // namespace onnx_frontend
